@@ -1,0 +1,724 @@
+---
+title: "FigureGeneration"
+format: html
+editor: visual
+---
+
+This script contains all scripts used in figure generation.
+
+# Create library
+
+```{r}
+rm(list = ls())
+
+# load packages
+library(readxl)
+library(ggplot2)
+library(ggpubr)
+library(dplyr)
+library(tidyr)
+library(reshape2)
+library(tidyverse)
+library(pROC)
+library(PRROC)
+library(precrec)
+library(ggvenn)
+
+# read data
+rna.expression <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/ISPY2/RNA/expression/mRNA_array_hugo.RData")
+metadata <- as.data.frame(read_excel("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/ISPY2/metadata/Supp Table 2.xlsx", skip = 1))
+metadata$`Patient Identifier` <- paste0("X",metadata$`Patient Identifier`)
+rownames(metadata) <- metadata$`Patient Identifier`
+
+features.training <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/InProgress/featuresReduced17+3Train_Ispy2_RFE")
+features.testing <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/InProgress/featuresReduced17+3Test_Ispy2_RFE")
+fgseaRes <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/InProgress/ReactomeEnrichmentPath181_Ispy2AllCtr")
+rf_rfe <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/RFEresult.rds")
+meta.training <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/ISPY2/ProcessedCtrlData/meta.training_2")
+meta.testing <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/ISPY2/ProcessedCtrlData/meta.testing_2")
+newModelPred <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/majorityVotingModelPrediction.rds")
+benchmarkModelPred <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/benchmarkPrediction.rds")
+shap.logitboost <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/logitboostSHAPvalues.rds")
+shap.nb <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/naivebayesSHAPvalues.rds")
+cl_shap <- read.csv("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/contrastiveLearningSHAPvalues.csv", header = T)
+logistboost_vec <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/LogitBoostPrediction_ISPY2CtrlTest.rds")
+nb_vec <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/NBPrediction_ISPY2CtrlTest.rds")
+cl_vec <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/contrastiveLearningPrediction.rds")
+neratinibPred <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/predictions_Neratinib.rds")
+amgPred <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/predictions_AMG386.rds")
+ganiPred <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/predictions_Ganitumab.rds")
+ganePred <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/predictions_Ganetespib.rds")
+permPred <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/predictions_Pembrolizumab.rds")
+tradMarker.nera <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/enrichedPathwaysNeratinib_traditionalApproach.rds")
+tradMarker.amg <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/enrichedPathwaysAMG386_traditionalApproach.rds")
+tradMarker.gani <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/enrichedPathwaysGanitumab_traditionalApproach.rds")
+tradMarker.gane <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/enrichedPathwaysGanetespib_traditionalApproach.rds")
+tradMarker.pemb <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/enrichedPathwaysPembrolizumab_traditionalApproach.rds")
+```
+
+# Figure 2
+## Fig 2A
+
+```{r}
+meta.training.pcr <- ifelse(meta.training$pCR == 0, "RD","pCR")
+meta.testing.pcr <- ifelse(meta.testing$pCR == 0, "RD","pCR")
+
+featuresAll <- rbind(features.training, features.testing)
+metaAll <- rbind(meta.training, meta.testing)
+
+# HR +ve/-ve pie chart
+HRstatus <- as.data.frame(metaAll[,c("pCR","HR")])
+HRstatus_long <- HRstatus %>%
+  group_by(HR) %>%
+  summarise(count = n()) %>%
+  mutate(prop = count / sum(count),
+         label = paste0(count,"\n"," (",round(prop*100,2), "%)"))
+HRstatus_long$HR <- ifelse(HRstatus_long$HR == 0, "Negative", "Positive")
+myCol <- c("Positive" = "#88abda",
+           "Negative" = "#d8e9f9")
+
+ggplot(HRstatus_long, aes(x = "", y = prop, fill = HR))+
+  geom_col(width = 1, color = "black")+
+  geom_text(aes(label = label), position = position_stack(vjust = 0.5), size = 7)+
+  coord_polar(theta = "y")+
+  scale_fill_manual(values = myCol)+
+  theme(
+    axis.text = element_blank(),
+    axis.title = element_blank(),
+    panel.grid = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    legend.position = "bottom",
+    legend.box = "horizontal",
+    legend.text = element_text(size = 14),
+    legend.title = element_text(size = 14),
+    legend.key.size = unit(1, "lines")
+  ) +
+  guides(fill = guide_legend(nrow = 2, byrow = TRUE))
+
+# Receptor status
+receptorStatus <- features.training[,18:20]
+colnames(receptorStatus) <- c("ERBB2","ESR1","PGR")
+ERstatus <- data.frame(Values = receptorStatus[,"ESR1"], Receptor = "ESR1")
+
+# ESR1 distribution
+ggplot(ERstatus, aes(x = Values)) +
+  geom_density(fill = "#87c0ca", alpha = 1) +
+  labs(x = expression(paste(italic("ESR1")," expression")), 
+       y = "Density", title = NULL) +
+  theme_classic() +
+  theme(
+    aspect.ratio = 1,
+    axis.text = element_text(size = 20, colour = "black"),
+    axis.title = element_text(size = 20),
+    plot.margin = margin(10, 10, 10, 10)
+  )
+```
+
+## Fig 2B
+
+```{r}
+# pie chart: feature overview
+# prepare data
+featureDescription <- data.frame(featureNames = colnames(features.training),
+                                 Class = rep(NA, ncol(features.training)))
+featureClass <- c(rep("Reactome proliferation-related pathways",6),
+                  rep("Reactome immune-related pathways",10),
+                  rep("Receptor status",3),
+                  rep("Reactome extracellular matrix-related pathways",1))
+featureDescription$Class <- featureClass
+class_counts <- featureDescription %>%
+  group_by(Class) %>%
+  summarise(count = n()) %>%
+  mutate(prop = count / sum(count),
+         label = paste0(Class, " (",count,")"))
+
+# prepare colour
+myCol <- c("Reactome proliferation-related pathways" = "#ECA7A7",
+           "Reactome immune-related pathways" = "#7793C8",
+           "Receptor status" = "#76A4B3",
+           "Reactome extracellular matrix-related pathways" = "#EAD89A")
+
+# plotting
+ggplot(class_counts, aes(x = "", y = prop, fill = Class))+
+  geom_col(width = 1, color = "black")+
+  geom_text(aes(label = count), position = position_stack(vjust = 0.6), size = 7)+
+  coord_polar(theta = "y")+
+  scale_fill_manual(values = myCol)+
+  theme(
+    axis.text = element_blank(),
+    axis.title = element_blank(),
+    panel.grid = element_blank(),
+    panel.background = element_rect(fill = "white"),
+    legend.position = "bottom",
+    legend.box = "horizontal",
+    legend.text = element_text(size = 12),
+    legend.title = element_text(size = 12),
+    legend.key.size = unit(1, "lines")
+  ) +
+  guides(fill = guide_legend(nrow = 5, byrow = TRUE))
+```
+
+## Fig 2C
+
+```{r}
+# bar plot for enriched Reactome features
+fgsea20 <- fgseaRes[fgseaRes$pathway %in% colnames(features.training),]
+groupIndex <- c(2,1,2,1,3,1,2,2,1,1,2,2,1,2,2,2,2)
+featureGroups <- c()
+for(i in groupIndex) {
+  if (i == 1) {
+    featureGroups <- append(featureGroups, "Reactome proliferation-related pathways")
+  } else if (i == 2) {
+      featureGroups <- append(featureGroups, "Reactome immune-related pathways")
+  } else {
+      featureGroups <- append(featureGroups, "Reactome extracellular matrix-related pathways")
+    }
+}
+fgsea20$Group <- featureGroups
+myCol <- c("Reactome proliferation-related pathways" = "#ECA7A7",
+           "Reactome immune-related pathways" = "#7793C8",
+           "Reactome extracellular matrix-related pathways" = "#EAD89A")
+
+g <- ggplot(fgsea20, aes(y = reorder(fgsea20$pathway, fgsea20$NES), x = fgsea20$NES, fill = Group)) +
+  geom_col(width = 0.7, alpha = 1) +  # smoother bar
+  scale_fill_manual(values = myCol)+
+  geom_text(aes(label = round(NES, 2)), 
+            hjust = -0.1, size = 6, color = "black") +  # value labels
+  labs(title = NULL, x = "Normalized enrichment score", y = NULL) +
+  theme_classic() +
+  theme(
+    panel.background = element_rect(fill = "white"),
+    plot.background = element_rect(fill = "white"),
+    panel.grid = element_blank(),  # remove gridlines
+    axis.text = element_text(size = 19, colour = "black"),
+    axis.title = element_text(size = 20),
+    axis.ticks = element_blank(),
+    legend.position = "none",
+    plot.title = element_text(size = 20)) +
+  coord_cartesian(clip = "off") +  # allow labels to extend beyond axis
+  scale_x_continuous(expand = expansion(mult = c(0, 0.2)))  # space for text labels
+g
+```
+
+## Fig 2D
+
+```{r}
+# boxplot: top enriched features (pCR vs RD)
+topFeatures <- fgsea20[order(fgsea20$NES, decreasing = T),"pathway"][1:4]
+topFeatures <- featuresAll[,colnames(featuresAll) %in% topFeatures$pathway]
+
+topFeatures_df <- topFeatures %>%
+  rownames_to_column(var = "Patient Identifier")
+for(i in 1:4) {
+  a <- topFeatures_df[,c(1,i+1)]
+  a_df <- left_join(a, metaAll[,c(1,4)], by = "Patient Identifier")
+  a_long <- a_df %>%
+    pivot_longer(cols = -c(1,3), names_to = "Feature", values_to = "Value")
+  a_long$pCR<- ifelse(a_long$pCR == 0, "RD","pCR")
+  assign(paste0(i,"_long"), a_long)
+}
+
+# plot
+ggplot(`1_long`, aes(x = pCR, y = Value, fill = pCR)) +
+  geom_boxplot(width = 0.8) +
+  scale_fill_manual(values = c("#66a9c9","#b0d5df")) +
+  stat_compare_means(
+    method = "t.test",
+    method.args = list(var.equal = TRUE),
+    label = "p.format",
+    size = 5.5,
+    label.x = 1.3
+  )+
+  labs(title = "Costimulation by the CD28 family", x = NULL, y = "Expression") +
+  theme_classic() +
+  theme(
+    aspect.ratio = 1,
+    axis.text = element_text(size = 20, color = "black"),
+    axis.title = element_text(size = 20),
+    legend.position = "none",
+    #legend.text = element_text(size = 15),
+    plot.title = element_text(size = 20, hjust = 0.5),
+    plot.margin = margin(10, 10, 10, 10)
+  )
+ggplot(`2_long`, aes(x = pCR, y = Value, fill = pCR)) +
+  geom_boxplot(width = 0.8) +
+  scale_fill_manual(values = c("#66a9c9","#b0d5df")) +
+  stat_compare_means(
+    method = "t.test",
+    method.args = list(var.equal = TRUE),
+    label = "p.format",
+    size = 5.5,
+    label.x = 1.3
+  )+
+  labs(title = "Downstream TCR signaling", x = NULL, y = "Expression") +
+  theme_classic() +
+  theme(
+    aspect.ratio = 1,
+    axis.text = element_text(size = 20, color = "black"),
+    axis.title = element_text(size = 20),
+    legend.position = "none",
+    #legend.text = element_text(size = 15),
+    plot.title = element_text(size = 20, hjust = 0.5),
+    plot.margin = margin(10, 10, 10, 10)
+  )
+ggplot(`3_long`, aes(x = pCR, y = Value, fill = pCR)) +
+  geom_boxplot(width = 0.8) +
+  scale_fill_manual(values = c("#66a9c9","#b0d5df")) +
+  stat_compare_means(
+    method = "t.test",
+    method.args = list(var.equal = TRUE),
+    label = "p.format",
+    size = 6
+  )+
+  labs(title = "Interleukin-10 signaling", x = NULL, y = "Expression") +
+  theme_classic() +
+  theme(
+    aspect.ratio = 1,
+    axis.text = element_text(size = 20),
+    axis.title = element_text(size = 20),
+    legend.position = "none",
+    #legend.text = element_text(size = 15),
+    plot.title = element_text(size = 20, hjust = 0.5),
+    plot.margin = margin(10, 10, 10, 10)
+  )
+ggplot(`4_long`, aes(x = pCR, y = Value, fill = pCR)) +
+  geom_boxplot(width = 0.8) +
+  scale_fill_manual(values = c("#66a9c9","#b0d5df")) +
+  stat_compare_means(
+    method = "t.test",
+    method.args = list(var.equal = TRUE),
+    label = "p.format",
+    size = 5.5,
+    label.x = 1.3
+  )+
+  labs(title = "Phosphorylation of CD3 and TCR zeta chains", x = NULL, y = "Expression") +
+  theme_classic() +
+  theme(
+    aspect.ratio = 1,
+    axis.text = element_text(size = 20, color = "black"),
+    axis.title = element_text(size = 20),
+    legend.position = "none",
+    #legend.text = element_text(size = 15),
+    legend.title = element_blank(),
+    plot.title = element_text(size = 20, hjust = 0.5),
+    plot.margin = margin(10, 10, 10, 10)
+  )
+```
+
+# Figure 3
+## Fig 3A
+
+```{r}
+roc1 <- roc(factor(meta.testing.pcr), benchmarkModelPred,
+            levels = c("RD","pCR"), direction = "<",print.auc = T)
+roc2 <- roc(factor(meta.testing.pcr), newModelPred,
+            levels = c("RD","pCR"), direction = "<",print.auc = T)
+
+# plotting
+par(pty = "s")
+plot(roc1, col = "#ECA7A7", lwd = 3, lty = 3, # lty: dotted line
+     main = NULL, legacy.axes = TRUE,
+     xlab = "FPR", ylab = "TPR", cex.lab=1.5, cex.axis=1.5, cex.main=1.5, cex.sub=1.5)
+plot(roc2, col = "#7793C8", lwd = 3, add = TRUE)
+legend("bottomright",
+       legend = c(paste("Benchmark", "\n", "(validation AUC =", round(pROC::auc(roc1), 3), ")","\n"),
+                  paste("Majority voting", "\n", "(validation AUC =", round(pROC::auc(roc2), 3), ")")),
+       col = c("#ECA7A7", "#7793C8"),
+       lwd = 3, lty = c(3, 1),
+       cex = 0.95, bty = "n", # no box around legend
+       inset = 0 # slight inset to avoid overlap
+       ) 
+```
+
+## Fig 3B
+
+```{r}
+# precision recall curve
+mm <- mmdata(scores = list(as.numeric(benchmarkModelPred), as.numeric(newModelPred)),
+             labels = list(meta.testing.pcr, meta.testing.pcr),
+             modnames = c("Benchmark", "Majority voting"))
+eval <- evalmod(mm, mode = "prc")
+
+plot_data <- fortify(eval)
+plot_data <- subset(plot_data, curvetype == "PRC")
+
+ggplot(plot_data, aes(x = x, y = y, color = modname, linetype = modname)) +
+  geom_line(size = 1.3) +
+  scale_color_manual(values = c("Benchmark" = "#ECA7A7", "Majority voting" = "#7793C8")) +
+  scale_linetype_manual(values = c("Benchmark" = "dashed", "Majority voting" = "solid")) +
+  theme_classic() +
+  theme(
+    aspect.ratio = 1,
+    axis.text = element_text(size = 18, colour = "black"),
+    axis.title = element_text(size = 18),
+    legend.position = c(0.75, 0.9),
+    legend.text = element_text(size = 14),
+    legend.title = element_blank(),
+    plot.title = element_blank(),
+    plot.margin = margin(10, 10, 10, 10),
+    panel.border = element_rect(colour = "black", fill=NA, linewidth=1)
+  ) +
+  labs(x = "Recall", y = "Precision")
+```
+
+## Fig 3C
+
+```{r}
+# Venn plot of prediction agreement
+logitboost_class <- ifelse(logistboost_vec > 0.5, "pCR", "RD")
+nb_class <- ifelse(nb_vec > 0.5, "pCR", "RD")
+cl_class <- ifelse(cl_vec > 0.5, "pCR", "RD")
+
+venn_data <- list(
+  LogitBoost = which(logitboost_class == "pCR"),
+  `Naive Bayes` = which(nb_class == "pCR"),
+  `Contrastive Learning` = which(cl_class == "pCR")
+)
+
+ggvenn(venn_data, 
+       fill_color = c("#d58785", "#c2b3c9", "#d9cbb7"),
+       show_percentage = F, show_elements = F,
+       stroke_size = 0.5, set_name_size = 5, text_size = 5.5)
+```
+
+## Fig 3D
+
+```{r}
+# overall SHAP
+# take mean absolute shap for CL model
+shap.cl <- data.frame(
+  Variable = shap.logitboost$Variable,
+  Importance = apply(cl_shap, 2, function(x) mean(abs(x))),
+  Model = "CL"
+)
+shap.logitboost$Model <- "LB"
+shap.nb$Model <- "NB"
+shap_all <- as.data.frame(rbind(shap.logitboost,shap.nb,shap.cl))
+rownames(shap_all) <- c(1:nrow(shap_all))
+colnames(shap_all)[2] <- "Feature\nImportance"
+
+# plotting
+ggplot(shap_all, aes(x = Model, y = fct_rev(Variable), fill = `Feature
+Importance`)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(low = "white", high = "#7793C8") +
+  labs(title = NULL, x = "", y = "") +
+  theme_classic()+
+  theme(
+    axis.text = element_text(size = 10, colour = "black"),
+    axis.title = element_text(size = 10),
+    legend.title = element_text(size = 11),
+    legend.text = element_text(size = 11)
+  )
+```
+
+# Figure 4
+## Fig 4A
+
+```{r}
+meta.neratinib <- metadata[metadata$Arm == "Paclitaxel + Neratinib",]
+rna.expression.nera <- rna.expression[ ,colnames(rna.expression) %in% rownames(meta.neratinib)]
+meta.neratinib <- meta.neratinib[rownames(meta.neratinib) %in% colnames(rna.expression),]
+meta.neratinib <- meta.neratinib[match(colnames(rna.expression.nera),rownames(meta.neratinib)),]
+stopifnot(sum(colnames(rna.expression.nera)!=rownames(meta.neratinib))==0)
+meta.neratinib <- meta.neratinib[meta.neratinib$`Receptor Subtype`== "HR+HER2-" | meta.neratinib$`Receptor Subtype`== "TN", ]
+meta.neratinib.pcr <- ifelse(meta.neratinib$pCR == 0, "RD","pCR")
+
+meta.amg <- metadata[metadata$Arm == "Paclitaxel + AMG 386",]
+rna.expression.amg <- rna.expression[ ,colnames(rna.expression) %in% rownames(meta.amg)]
+meta.amg <- meta.amg[rownames(meta.amg) %in% colnames(rna.expression),]
+meta.amg <- meta.amg[match(colnames(rna.expression.amg),rownames(meta.amg)),]
+stopifnot(sum(colnames(rna.expression.amg)!=rownames(meta.amg))==0)
+meta.amg.pcr <- ifelse(meta.amg$pCR == 0, "RD","pCR")
+
+meta.ganitumab <- metadata[metadata$Arm == "Paclitaxel + Ganitumab",]
+rna.expression.gani <- rna.expression[ ,colnames(rna.expression) %in% rownames(meta.ganitumab)]
+meta.ganitumab <- meta.ganitumab[rownames(meta.ganitumab) %in% colnames(rna.expression),]
+meta.ganitumab <- meta.ganitumab[match(colnames(rna.expression.gani),rownames(meta.ganitumab)),]
+stopifnot(sum(colnames(rna.expression.gani)!=rownames(meta.ganitumab))==0)
+meta.gani.pcr <- ifelse(meta.ganitumab$pCR == 0, "RD","pCR")
+
+meta.gane <- metadata[metadata$Arm == "Paclitaxel + Ganetespib",]
+rna.expression.gane <- rna.expression[ ,colnames(rna.expression) %in% rownames(meta.gane)]
+meta.gane <- meta.gane[rownames(meta.gane) %in% colnames(rna.expression),]
+meta.gane <- meta.gane[match(colnames(rna.expression.gane),rownames(meta.gane)),]
+stopifnot(sum(colnames(rna.expression.gane)!=rownames(meta.gane))==0)
+meta.gane.pcr <- ifelse(meta.gane$pCR == 0, "RD","pCR")
+
+meta.pemb <- metadata[metadata$Arm == "Paclitaxel + Pembrolizumab",]
+rna.expression.pemb <- rna.expression[ ,colnames(rna.expression) %in% rownames(meta.pemb)]
+meta.pemb <- meta.pemb[rownames(meta.pemb) %in% colnames(rna.expression),]
+meta.pemb <- meta.pemb[match(colnames(rna.expression.pemb),rownames(meta.pemb)),]
+stopifnot(sum(colnames(rna.expression.pemb)!=rownames(meta.pemb))==0)
+meta.pemb.pcr <- ifelse(meta.pemb$pCR == 0, "RD","pCR")
+```
+
+```{r}
+roc.nera <- roc(factor(meta.neratinib.pcr), neratinibPred,
+            levels = c("RD","pCR"), direction = "<",print.auc = T)
+roc.amg <- roc(factor(meta.amg.pcr), amgPred,
+            levels = c("RD","pCR"), direction = "<",print.auc = T)
+roc.gani <- roc(factor(meta.gani.pcr), ganiPred,
+            levels = c("RD","pCR"), direction = "<",print.auc = T)
+roc.gane <- roc(factor(meta.gane.pcr), ganePred,
+            levels = c("RD","pCR"), direction = "<",print.auc = T)
+roc.perm <- roc(factor(meta.pemb.pcr), permPred,
+            levels = c("RD","pCR"), direction = "<",print.auc = T)
+
+# plotting
+par(pty = "s")
+plot(roc.nera, col = "#ECA7A7", lwd = 3, main = NULL, legacy.axes = TRUE, xlab = "FPR", ylab = "TPR")
+plot(roc.amg, col = "#7793C8", lwd = 3, add = TRUE)
+plot(roc.gani, col = "#76A4B3", lwd = 3, add = TRUE)
+plot(roc.gane, col = "#EAD89A", lwd = 3, add = TRUE)
+plot(roc.perm, col = "#F2E3E6", lwd = 3, add = TRUE)
+legend("bottomright",
+       legend = c(paste("Neratinib (AUC =", round(pROC::auc(roc.nera), 3), ")"),
+                  paste("AMG386 (AUC =", round(pROC::auc(roc.amg), 3), ")"),
+                  paste("Ganitumab (AUC =", round(pROC::auc(roc.gani), 3), ")"),
+                  paste("Ganetespib (AUC =", round(pROC::auc(roc.gane), 3), ")"),
+                  paste("Pembrolizumab (AUC =", round(pROC::auc(roc.perm), 3), ")")),
+       col = c("#ECA7A7", "#7793C8","#76A4B3","#EAD89A","#F2E3E6"),
+       lwd = 3,
+       cex = 0.7, bty = "n",
+       inset = 0.01)
+```
+
+## Fig 4B
+
+```{r}
+# case stats
+predictionDescription.df <- as.data.frame(matrix(nrow = 5,ncol = 4))
+colnames(predictionDescription.df) <- c("True Positive","False Negative",
+                                        "False Positive","True Negative")
+rownames(predictionDescription.df) <- c("Neratinib","AMG386","Ganitumab","Ganetespib","Pembrolizumab")
+predictionDescription.df[1,] <- c(1,14,6,28)
+predictionDescription.df[2,] <- c(9,12,11,71)
+predictionDescription.df[3,] <- c(10,8,15,67)
+predictionDescription.df[4,] <- c(7,12,15,53)
+predictionDescription.df[5,] <- c(7,9,4,34)
+predictionDescription.df$Treatment <- rownames(predictionDescription.df)
+
+# plotting
+df_long <- predictionDescription.df %>%
+  pivot_longer(cols = c(`True Positive`, `False Negative`, `False Positive`, `True Negative`),
+               names_to = "Class",
+               values_to = "Count")
+df_long <- df_long %>%
+  mutate(
+    # Treatment = factor(Treatment, levels = c("Neratinib", "AMG386", 
+    #                                          "Ganitumab", "Ganetespib", "Pembrolizumab")),
+         Class = factor(Class, levels = c("True Positive", "False Negative", 
+                                          "False Positive", "True Negative")))
+df_long <- df_long %>%
+  arrange(Treatment, Class) %>%
+  group_by(Treatment) %>%
+  mutate(
+    rev_count = rev(Count),
+    rev_cumsum = cumsum(rev_count),
+    ymax = rev(rev_cumsum),
+    ymin = ymax - Count,
+    ypos = (ymin + ymax) / 2
+  ) %>%
+  ungroup()
+
+ggplot(df_long, aes(x = Treatment, y = Count, fill = Class)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = Count, y = ypos), color = "black", size = 4) +
+  scale_fill_manual(values = c("True Positive" = "#a55b6c", "False Negative" = "#f5e3e6",
+                               "False Positive" = "#a0aeb2", "True Negative" = "#e7a49a")) +
+  labs(title = NULL, y = "Number of patients", x = NULL, fill = "Class") +
+  theme_classic(base_size = 10)+
+  theme(
+    aspect.ratio = 1,
+    legend.position = "inside",
+    legend.position.inside = c(1, 0.95),  # top-right inside
+    legend.justification = c("right", "top"),
+    axis.text = element_text(size = 10),
+    axis.title = element_text(size = 10),
+    legend.title = element_text(size = 9),
+    legend.text = element_text(size = 9)
+  )
+```
+
+## Fig 4E
+
+```{r fig.width=11, fig.height=6}
+tradMarker.nera <- tradMarker.nera %>%
+  mutate(NES_sign = ifelse(NES >= 0, "Positive", "Negative"),
+         yax = ifelse(NES >= 0, -0.02, 0.02),
+         col = ifelse(NES >= 0, "#f0cfe3", "#2775b6"))
+myCol <- c("Positive"= "black","Negative" = "black")
+
+# plotting
+ggplot(tradMarker.nera, aes(y = NES, x = reorder(pathway, NES), label = pathway)) +
+  geom_text(aes(y = yax, color = NES_sign, hjust = NES > 0), size = 6.5)+
+  geom_bar(stat = "identity", aes(fill = col))+
+  geom_hline(yintercept = 0)+
+  coord_flip(ylim = c(-2,3.3), clip = "off")+
+  scale_fill_manual(values = c("#f0cfe3","#2775b6")) +
+  scale_color_manual(values = myCol, guide = "none") +
+  scale_x_discrete(breaks = NULL) +
+  labs(y = "Normalized enrichment score", x = NULL, title = "Neratinib", fill = NULL) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),  
+    axis.text.x = element_text(size = 16),
+    axis.title = element_text(size = 20),
+    panel.grid = element_blank(),
+    legend.position = "none",
+    plot.title = element_text(size = 20, hjust = 0.5),
+    plot.margin = unit(c(0.5,0.5,0.5,2), "lines")
+  )
+```
+
+```{r fig.width=11, fig.height=6}
+tradMarker.amg <- tradMarker.amg %>%
+  mutate(NES_sign = ifelse(NES >= 0, "Positive", "Negative"),
+         yax = ifelse(NES >= 0, -0.02, 0.02),
+         col = ifelse(NES >= 0, "#f0cfe3", "#2775b6"))
+myCol <- c("Positive"="black","Negative" = "black")
+
+# plotting
+ggplot(tradMarker.amg, aes(y = NES, x = reorder(pathway, NES), label = pathway)) +
+  geom_text(aes(y = yax, color = NES_sign, hjust = NES > 0), size = 6)+
+  geom_bar(stat = "identity", aes(fill = col))+
+  geom_hline(yintercept = 0)+
+  coord_flip(ylim = c(-3,3), clip = "off")+
+  scale_fill_manual(values = c("#f0cfe3","#2775b6")) +
+  scale_color_manual(values = myCol, guide = "none") +
+  scale_x_discrete(breaks = NULL) +
+  labs(y = "Normalized enrichment score", x = NULL, title = "AMG386", fill = NULL) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),  
+    axis.text.x = element_text(size = 16),
+    axis.title = element_text(size = 20),
+    panel.grid = element_blank(),
+    legend.position = "none",
+    plot.title = element_text(size = 20, hjust = 0.5),
+    plot.margin = unit(c(0.5,0.5,0.5,2), "lines")
+  )
+```
+
+# Supplementary Figure 1
+## Supplementary Fig 1A
+
+```{r}
+# RFE plot
+rfeResults <- rf_rfe$results
+best_point <- rfeResults %>% filter(Variables == 17)
+
+ggplot(rfeResults, aes(x = Variables, y = Accuracy)) +
+  geom_line(color = "#7793C8") +
+  geom_point(color = "#7793C8") +
+  geom_point(data = best_point, aes(x = Variables, y = Accuracy), 
+             shape = 20, size = 3, color = "#ECA7A7") +
+  geom_text(data = best_point, aes(label = "(n = 17 features)", 
+                                   x = Variables + 15, y = Accuracy + 0.002),
+            color = "black", size = 5) +
+  theme_classic() +
+  labs(x = "Number of features",
+       y = "Accuracy",
+       title = NULL) +
+  theme(
+    text = element_text(size = 16),
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 14),
+    plot.title = element_text(size = 20)
+  )
+```
+
+## Supplementary Fig 1B
+
+```{r fig.width=11, fig.height=6}
+tradMarker.gani <- tradMarker.gani %>%
+  mutate(NES_sign = ifelse(NES >= 0, "Positive", "Negative"),
+         yax = ifelse(NES >= 0, -0.02, 0.02),
+         col = ifelse(NES >= 0, "#f0cfe3", "#2775b6"))
+myCol <- c("Positive"="black","Negative" = "black")
+
+# plotting
+ggplot(tradMarker.gani, aes(y = NES, x = reorder(pathway, NES), label = pathway)) +
+  geom_text(aes(y = yax, color = NES_sign, hjust = NES > 0), size = 5.8)+
+  geom_bar(stat = "identity", aes(fill = col))+
+  geom_hline(yintercept = 0)+
+  coord_flip(ylim = c(-2.5,2.5), clip = "off")+
+  scale_fill_manual(values = c("#f0cfe3","#2775b6")) +
+  scale_color_manual(values = myCol, guide = "none") +
+  scale_x_discrete(breaks = NULL) +
+  labs(y = "Normalized enrichment score", x = NULL, title = "Ganitumab", fill = NULL) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),  
+    axis.text.x = element_text(size = 16),
+    axis.title = element_text(size = 20),
+    panel.grid = element_blank(),
+    legend.position = "none",
+    plot.title = element_text(size = 20, hjust = 0.5),
+    plot.margin = unit(c(0.5,0.5,0.5,2), "lines")
+  )
+```
+
+```{r fig.width=11, fig.height=6}
+tradMarker.gane <- tradMarker.gane %>%
+  mutate(NES_sign = ifelse(NES >= 0, "Positive", "Negative"),
+         yax = ifelse(NES >= 0, -0.02, 0.02),
+         col = ifelse(NES >= 0, "#f0cfe3", "#2775b6"))
+myCol <- c("Positive"="black","Negative" = "black")
+
+# plotting
+ggplot(tradMarker.gane, aes(y = NES, x = reorder(pathway, NES), label = pathway)) +
+  geom_text(aes(y = yax, color = NES_sign, hjust = NES > 0), size = 5.5)+
+  geom_bar(stat = "identity", aes(fill = col))+
+  geom_hline(yintercept = 0)+
+  coord_flip(ylim = c(-2.2,3.3), clip = "off")+
+  scale_fill_manual(values = c("#f0cfe3","#2775b6")) +
+  scale_color_manual(values = myCol, guide = "none") +
+  scale_x_discrete(breaks = NULL) +
+  labs(y = "Normalized enrichment score", x = NULL, title = "Ganetespib", fill = NULL) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),  
+    axis.text.x = element_text(size = 16),
+    axis.title = element_text(size = 20),
+    panel.grid = element_blank(),
+    legend.position = "none",
+    plot.title = element_text(size = 20, hjust = 0.5),
+    plot.margin = unit(c(0.5,0.5,0.5,0.5), "lines")
+  )
+```
+
+```{r fig.width=11, fig.height=6}
+tradMarker.pemb <- tradMarker.pemb %>%
+  mutate(NES_sign = ifelse(NES >= 0, "Positive", "Negative"),
+         yax = ifelse(NES >= 0, -0.02, 0.02),
+         col = ifelse(NES >= 0, "#f0cfe3", "#2775b6"))
+myCol <- c("Positive"="black","Negative" = "black")
+
+# plotting
+ggplot(tradMarker.pemb, aes(y = NES, x = reorder(pathway, NES), label = pathway)) +
+  geom_text(aes(y = yax, color = NES_sign, hjust = NES > 0), size = 5)+
+  geom_bar(stat = "identity", aes(fill = col))+
+  geom_hline(yintercept = 0)+
+  coord_flip(ylim = c(-2.1,2.5), clip = "off")+
+  scale_fill_manual(values = c("#f0cfe3","#2775b6")) +
+  scale_color_manual(values = myCol, guide = "none") +
+  scale_x_discrete(breaks = NULL) +
+  labs(y = "Normalized enrichment score", x = NULL, title = "Pembrolizumab", fill = NULL) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),  
+    axis.text.x = element_text(size = 16),
+    axis.title = element_text(size = 20),
+    panel.grid = element_blank(),
+    legend.position = "none",
+    plot.title = element_text(size = 20, hjust = 0.5),
+    plot.margin = unit(c(0.5,0.5,0.5,0.01), "lines")
+  )
+```

@@ -1,0 +1,3542 @@
+---
+title: "FullScript"
+format: html
+editor: visual
+---
+
+This script contains all analysis scripts and workflows used in thesis.
+
+# Create library
+
+```{r}
+rm(list = ls())
+
+# load packages
+library(caret)
+library(dplyr)
+library(readxl)
+library(purrr)
+library(igraph)
+library(singscore)
+library(limma)
+library(fgsea)
+library(pROC)
+library(vip)
+library(tidyverse)
+library(reticulate)
+library(ggplot2)
+library(ggpubr)
+library(GSVA)
+library(GSEABase)
+library(org.Hs.eg.db)
+library(edgeR)
+library(IOBR)
+
+# specify conda environment
+use_condaenv(condaenv = "r-reticulate",conda = "/Users/jleng/miniconda/bin/conda")
+
+# read data
+rna.expression <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/ISPY2/RNA/expression/mRNA_array_hugo.RData")
+metadata <- as.data.frame(read_excel("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/ISPY2/metadata/Supp Table 2.xlsx", skip = 1))
+metadata$`Patient Identifier` <- paste0("X",metadata$`Patient Identifier`)
+rownames(metadata) <- metadata$`Patient Identifier`
+
+# read database
+genomicInstabilityList <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/pathway lists/Genomic_instability.rds")
+expressClassificationList <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/pathway lists/EXPRESS-ML-genes.Rds")
+ReactomePath <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/pathway lists/Reactome-3.7.Rds")
+
+# set random seed for reproducibility
+set.seed(1343)
+```
+
+```{python}
+# load python modules
+import random
+import numpy as np
+import pandas as pd
+import scipy
+from scipy.interpolate import interp1d
+from scipy.stats import spearmanr
+import matplotlib.pyplot as plt
+from matplotlib import rcParams
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.nn.utils.prune as prune
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset, TensorDataset
+import pytorch_lightning as pl
+from pytorch_lightning import Trainer
+import sklearn
+from sklearn import svm
+from sklearn.base import BaseEstimator, RegressorMixin, TransformerMixin, clone
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.linear_model import LogisticRegression
+from sklearn.manifold import TSNE
+from sklearn.metrics import (
+    accuracy_score,
+    auc,
+    classification_report,
+    confusion_matrix,
+    fowlkes_mallows_score,
+    jaccard_score,
+    mean_squared_error,
+    precision_score,
+    roc_auc_score,
+    roc_curve,
+)
+from sklearn.model_selection import (
+    RandomizedSearchCV,
+    RepeatedStratifiedKFold,
+    StratifiedKFold,
+)
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVC
+import shap
+```
+
+# 0. Data pre-processing
+## 0.1 Select I-SPY2 control arm
+
+```{r}
+# patients with Paclitaxel treatment only
+meta.ctr <- metadata[metadata$Arm == "Paclitaxel",]
+
+# subset data
+rna.expression.ctr <- rna.expression[ ,colnames(rna.expression) %in% rownames(meta.ctr)]
+meta.ctr <- meta.ctr[rownames(meta.ctr) %in% colnames(rna.expression),]
+meta.ctr <- meta.ctr[match(colnames(rna.expression.ctr),rownames(meta.ctr)),]
+stopifnot(sum(colnames(rna.expression.ctr)!=rownames(meta.ctr))==0)
+dim(rna.expression.ctr) # 179 patients
+```
+
+```{r}
+# extract receptor expression intensities
+expr.erbb2 <- rna.expression.ctr["ERBB2",]
+names(expr.erbb2) <- rownames(meta.ctr)
+
+expr.esr1 <- rna.expression.ctr["ESR1",]
+names(expr.esr1) <- rownames(meta.ctr)
+
+expr.pgr <- rna.expression.ctr["PGR",]
+names(expr.pgr) <- rownames(meta.ctr)
+
+# combine to new features
+features.receptorStatus <- data.frame(expr.erbb2, expr.esr1, expr.pgr)
+colnames(features.receptorStatus) <- c("ERBB2expression","ESR1expression","PGRexpression")
+dim(features.receptorStatus)
+```
+
+```{r}
+saveRDS(rna.expression.ctr, "~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/ISPY2/ProcessedCtrlData/rna.expression.ctr")
+saveRDS(meta.ctr, "~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/ISPY2/ProcessedCtrlData/meta.ctr")
+saveRDS(features.receptorStatus, "~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/ISPY2/ProcessedCtrlData/features.receptorStatus")
+```
+
+## 0.2 Data splitting
+
+```{r}
+meta.ctr <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/ISPY2/ProcessedCtrlData/meta.ctr")
+
+# define function for stratifying patients
+splitBySubtypePcrRd <- function(metadata, subtypeCol, pcrRdCol) {
+  # separate by subtype
+  m <- metadata %>%
+    group_by(metadata[subtypeCol]) %>%
+    group_split(.keep = T)
+  
+  # separate by pCR.RD
+  m <- lapply(m, function(x) {
+    x %>%
+      group_by(x[pcrRdCol]) %>%
+      group_split(.keep = T)
+  })
+  return(m)
+}
+
+# function calling
+meta.ctr.sepBySubtypePcrRd <- splitBySubtypePcrRd(metadata = meta.ctr,
+                                                  subtypeCol = "Receptor Subtype",
+                                                  pcrRdCol = "pCR")
+
+# merge the multilevel list to a flat list
+meta.ctr.sepBySubtypePcrRd <- flatten(meta.ctr.sepBySubtypePcrRd)
+meta.ctr.sepBySubtypePcrRd <- lapply(meta.ctr.sepBySubtypePcrRd, as.data.frame)
+```
+
+```{r}
+# define function for splitting data
+getSample2 <- function(fullData, prop){
+  set.seed(1343)
+  train.index <- sample(1:nrow(fullData), size = floor(prop*nrow(fullData)))
+  list(trainset <- fullData[train.index, ], testset <- fullData[-train.index, ])
+}
+
+# function calling
+meta.splitted1 <- lapply(meta.ctr.sepBySubtypePcrRd, getSample2, prop = 0.8)
+
+# combine train / test data
+meta.training1 <- matrix(nrow = 0, ncol = ncol(meta.ctr))
+colnames(meta.training1) <- colnames(meta.ctr)
+meta.testing1 <- matrix(nrow = 0, ncol = ncol(meta.ctr))
+colnames(meta.testing1) <- colnames(meta.ctr)
+
+for(i in 1:length(meta.splitted1)) {
+  meta.training1 <- rbind(meta.training1, meta.splitted1[[i]][[1]])
+  meta.testing1 <- rbind(meta.testing1, meta.splitted1[[i]][[2]])
+}
+rownames(meta.training1) <- meta.training1[,"Patient Identifier"]
+rownames(meta.testing1) <- meta.testing1[,"Patient Identifier"]
+
+# sanity check
+table(meta.training1$pCR) # 119:23 RD/pCR
+table(meta.testing1$pCR) # 20:7
+ 
+table(meta.training1$`Receptor Subtype`) # 75:67 HR+HER2- / TN
+table(meta.testing1$`Receptor Subtype`) # 19:18
+```
+
+```{r}
+# save 80:20 training/validating data
+saveRDS(meta.training1, "~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/ISPY2/ProcessedCtrlData/meta.training_2")
+saveRDS(meta.testing1, "~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/ISPY2/ProcessedCtrlData/meta.testing_2")
+```
+
+# 1. Feature extraction
+## 1.1 Reactome features
+### Filter pathways
+
+```{r}
+# loading saved data
+rna.expression.ctr <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/ISPY2/ProcessedCtrlData/rna.expression.ctr")
+meta.ctr <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/ISPY2/ProcessedCtrlData/meta.ctr")
+
+# list pathways to include
+root <- c('R-HSA-1640170', # cell cycle
+          'R-HSA-168256', # immune system
+          'R-HSA-1474244', # extracellular matrix organization
+          'R-HSA-1500931') # cell-cell communication
+graph <- graph_from_data_frame(ReactomePath$relationships,directed = T)
+path  <- ego(graph, order=length(V(graph)), nodes=root, mode="out") # extract all downstream pathways
+toInclude <- names(unlist(path)) # 364 pathways to include
+graph <- make_ego_graph(graph, order=length(V(graph)), nodes=root, mode="out")
+
+# extract pathways
+ReactomePath$genesets <- ReactomePath$genesets[(ReactomePath$geneset.descriptions %in% toInclude)]
+ReactomePath$geneset.names <- ReactomePath$geneset.names[(ReactomePath$geneset.descriptions %in% toInclude)]
+ReactomePath$geneset.descriptions <- ReactomePath$geneset.descriptions[(ReactomePath$geneset.descriptions %in% toInclude)]
+names(ReactomePath$genesets) <- ReactomePath$geneset.names
+reactome.pathways <- ReactomePath$genesets # 364 pathways
+
+# filter out pathways which contain < 15 genes
+toExclude.short <- names(reactome.pathways)[sapply(reactome.pathways, length) < 15] # 101
+reactome.pathways <- reactome.pathways[!(names(reactome.pathways) %in% toExclude.short)]
+length(reactome.pathways) # 263 pathways (contain > 15 genes)
+```
+
+### Reactome enrichment
+
+```{r}
+# design matrix
+response <- factor(meta.ctr$pCR, levels=c(0,1), labels=c("RD","pCR"))
+design <- model.matrix(~0 + response)
+rownames(design) <-rownames(meta.ctr)
+contrast.matrix <- makeContrasts(responsepCR-responseRD, levels = design)
+
+# fit linear model
+fit <- lmFit(rna.expression.ctr, design = design)
+fit <- contrasts.fit(fit, contrasts = contrast.matrix)
+efit <- eBayes(fit, trend = TRUE,robust = TRUE)
+degs_ebayes <- topTable(efit, adjust.method="BH", sort.by = "p", n=Inf, p.value = 1)
+
+# label significant genes
+treat_table <- degs_ebayes %>% 
+  mutate(expression = case_when(logFC >= 0 & adj.P.Val < 0.15 ~ "Up-regulated",
+                                logFC <= 0 & adj.P.Val < 0.15 ~ "Down-regulated",
+                                adj.P.Val>= 0.15 ~ "Not-DE"))
+
+print(degs_ebayes[1:10, ])
+print(treat_table[1:10, ]) # no significant DE genes present
+
+# rank all the genes by fold change
+treat_table <- treat_table[order(treat_table$logFC), ]
+treat.ranked <- treat_table$logFC
+names(treat.ranked) <- rownames(treat_table)
+```
+
+```{r}
+# perform enrichment analysis
+fgseaRes <- fgsea(pathways = reactome.pathways, 
+                  stats    = treat.ranked,
+                  minSize  = 15,
+                  maxSize  = 400) # 249
+fgseaRes<-fgseaRes[fgseaRes$padj<0.05,] # significant pathways: 181
+
+# convert to a list for calculating stingscore
+EnrichedReactomePath <- setNames(fgseaRes[[8]], fgseaRes[[1]])
+```
+
+### Reactome singscore
+
+```{r}
+# define function to calculate singscore
+calculateSingScore <- function(expressionMatrix, allPathways) {
+  rank_genes <- rankGenes(expressionMatrix)
+  
+  reactome.scores <- data.frame(matrix(nrow = ncol(expressionMatrix), 
+                                            ncol = length(allPathways)))
+  rownames(reactome.scores) <- colnames(expressionMatrix)
+  
+  for(i in 1:length(allPathways)) {
+    score <- simpleScore(rankData = rank_genes,
+                         upSet = allPathways[[i]]) # extract gene sets
+    reactome.scores[,i] <- score[,1] # extract Totalscore
+    colnames(reactome.scores)[i] <- names(allPathways)[i] # pathway names
+  }
+  reactome.scores
+}
+
+# function calling
+reactome.scores <- calculateSingScore(expressionMatrix = rna.expression.ctr,
+                                      allPathways = EnrichedReactomePath)
+```
+
+```{r}
+saveRDS(reactome.scores, "~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/InProgress/ReactomeScores181_Ispy2AllCtr_NotNormalized")
+saveRDS(fgseaRes,"~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/InProgress/ReactomeEnrichmentPath181_Ispy2AllCtr")
+```
+
+## 1.2 Extra features
+
+```{r}
+# loading saved data
+rna.expression <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/ISPY2/ProcessedCtrlData/rna.expression.ctr")
+meta.training <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/ISPY2/ProcessedCtrlData/meta.training_2")
+meta.testing <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/ISPY2/ProcessedCtrlData/meta.testing_2")
+
+# extract classification related genes
+# e10: more related to cell proliferation
+# e4: more related to TME
+e10Genes <- expressClassificationList$filter03_final$up
+e4Genes <- expressClassificationList$filter03_final$down
+```
+
+```{r}
+# singscore function calling
+genomicInstability.scores <- calculateSingScore(expressionMatrix = rna.expression,
+                                                allPathways = genomicInstabilityList)
+
+rank_genes <- rankGenes(rna.expression)
+e4e10.scores.df <- simpleScore(rankData = rank_genes,
+                            upSet = e10Genes,
+                            downSet = e4Genes)
+e4e10.scores <- as.data.frame(e4e10.scores.df[,c(1,3,5)])
+rownames(e4e10.scores) <- rownames(e4e10.scores.df)
+colnames(e4e10.scores) <- c("e4e10Score","e10","e4")
+
+print(genomicInstability.scores[1:5,1:5])
+print(e4e10.scores[1:5,])
+```
+
+```{r}
+saveRDS(genomicInstability.scores, "~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/InProgress/featuresExtra_genomicInstability")
+saveRDS(e4e10.scores, "~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/InProgress/featuresExtra_e4e10Classification")
+```
+
+# 2. Feature reduction
+## 2.1 Recursive feature elimination
+
+```{r}
+# loading saved data
+reactome.scores <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/InProgress/ReactomeScores181_Ispy2AllCtr_NotNormalized")
+fgseaRes <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/InProgress/ReactomeEnrichmentPath181_Ispy2AllCtr")
+genomicInstability.scores <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/InProgress/featuresExtra_genomicInstability")
+e4e10.scores <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/InProgress/featuresExtra_e4e10Classification")
+features.receptorStatus <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/ISPY2/ProcessedCtrlData/features.receptorStatus")
+
+# combine features: reactome 181 + genomic instablity 9 + classification 1
+featuresAllCombined <- cbind(reactome.scores, genomicInstability.scores, e4e10.scores$e4e10Score)
+colnames(featuresAllCombined)[191] <- "e4e10Score"
+table(colnames(featuresAllCombined))[table(colnames(featuresAllCombined)) > 1] # no duplication
+boxplot(featuresAllCombined)
+```
+
+### Split features
+
+```{r}
+# split to train/test first, then perform feature selection to prevent leakage
+# split by training / testing index in metadata
+features.training <- featuresAllCombined[rownames(featuresAllCombined) %in% rownames(meta.training), ]
+features.testing <- featuresAllCombined[rownames(featuresAllCombined) %in% rownames(meta.testing), ]
+dim(features.training) # [142,351]
+
+# match features and metadata
+features.training <- features.training[match(rownames(meta.training), rownames(features.training)),]
+features.testing <- features.testing[match(rownames(meta.testing), rownames(features.testing)),]
+stopifnot(sum(rownames(features.training)!=rownames(meta.training))==0)
+```
+
+### RFE
+
+```{r}
+# set up control function
+ctrl.rfe <- rfeControl(functions = caretFuncs,
+                       method = "cv",
+                       number = 10,
+                       verbose = T,
+                       allowParallel = T
+                       )
+subsets <- seq(15,40) # number of features to subset
+
+# perform RFE selection
+rf_rfe <- rfe(x = features.training, 
+              y = factor(meta.training$pCR),
+              sizes = subsets,
+              rfeControl = ctrl.rfe
+              )
+
+# final model
+print(rf_rfe) # 17 features selected
+predictors(rf_rfe) # 17 feature names
+plot(rf_rfe, type = c("g","o"))
+
+# variable importance
+varimp.rfe <- varImp(rf_rfe)
+varimp.rfe$features <- rownames(varimp.rfe)
+top17 <- as.data.frame(varimp.rfe[rownames(varimp.rfe) %in% predictors(rf_rfe),])
+top17$features <- NULL
+
+# filter data by selected 17 features
+features.training <- features.training[,colnames(features.training) %in% rownames(top17)]
+features.testing <- features.testing[,colnames(features.testing) %in% rownames(top17)]
+dim(features.training) # [142,17]
+```
+
+### Add subtype information
+
+```{r}
+# scale expression markers
+scale.backup <- scale(features.receptorStatus[,1])
+for(i in 1:ncol(features.receptorStatus)) {
+  features.receptorStatus[,i] <- scale(features.receptorStatus[,i])
+}
+stopifnot(sum(scale.backup != features.receptorStatus[,1]) == 0)
+boxplot(features.receptorStatus)
+
+# split by training / testing index in expression markers
+features.receptorStatus.train <- features.receptorStatus[rownames(features.receptorStatus) %in% rownames(meta.training), ]
+features.receptorStatus.test <- features.receptorStatus[rownames(features.receptorStatus) %in% rownames(meta.testing), ]
+
+# match features with metadata
+features.receptorStatus.train <- features.receptorStatus.train[match(rownames(meta.training), rownames(features.receptorStatus.train)),]
+features.receptorStatus.test <- features.receptorStatus.test[match(rownames(meta.testing), rownames(features.receptorStatus.test)),]
+stopifnot(sum(rownames(features.receptorStatus.train) != rownames(meta.training)) == 0)
+
+# combine features to generate final feature set
+features.training <- cbind(features.training, as.matrix(features.receptorStatus.train))
+features.testing <- cbind(features.testing, as.matrix(features.receptorStatus.test))
+boxplot(features.training)
+dim(features.training) # 20 features in total
+```
+
+```{r}
+saveRDS(features.training, "~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/InProgress/featuresReduced17+3Train_Ispy2_RFE")
+saveRDS(features.testing, "~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/InProgress/featuresReduced17+3Test_Ispy2_RFE")
+saveRDS(rf_rfe, "~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/RFEresult.rds")
+```
+
+# 3. ML model construction
+## 3.1 Algorithms testing
+
+```{r}
+# loading saved data
+meta.training <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/ISPY2/ProcessedCtrlData/meta.training_2")
+meta.testing <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/ISPY2/ProcessedCtrlData/meta.testing_2")
+features.training <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/InProgress/featuresReduced18Train_Ispy2_RFE")
+features.testing <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/InProgress/featuresReduced18Test_Ispy2_RFE")
+
+# convert 0/1 to pCR/RD
+meta.training.pcr <- ifelse(meta.training$pCR == 0, "RD", "pCR")
+meta.testing.pcr <- ifelse(meta.testing$pCR == 0, "RD", "pCR")
+```
+
+### Normalization
+
+```{r}
+# scale whole feature set
+for(i in 1:20) {
+  features.training[,i] <- as.numeric(scale(features.training[,i]))
+  features.testing[,i] <- as.numeric(scale(features.testing[,i]))
+}
+stopifnot(as.numeric(scale.backup) == as.numeric(features.training[,18]))
+sd(features.training[,2]) # sanity check
+boxplot(features.training)
+```
+
+### Train caret models
+
+```{r}
+# model training
+logreg_control <- trainControl(method = "repeatedcv",
+                            number = 10,
+                            repeats = 5,
+                            classProbs = T,
+                            summaryFunction = twoClassSummary,
+                            savePredictions = "final"
+                            )
+
+logregFit.test <- train(x = features.training,
+                y = factor(meta.training.pcr),
+                method = "glm",
+                #method = "rf",
+                #method = "xgbTree",
+                #method = "svmLinear",
+                #method = "naive_bayes",
+                #method = "LogitBoost",
+                metric = "ROC",
+                trControl = logreg_control,
+                )
+logregTest.predict <- predict(logregFit.test, features.testing, type = "prob")
+
+# evaluate performance in validation set
+par(pty = "s")
+roc(factor(meta.testing.pcr), logregTest.predict[,"pCR"],levels = c("RD","pCR"), direction = "<",
+    plot = T, asp = NA, col = "royalblue", lwd = 2, legacy.axes = T, print.auc = T,
+    main = "ROC curve for Test model in ISPY2 Ctr cohort")
+confusionMatrix(factor(ifelse(logregTest.predict[,"pCR"]>0.5, "pCR","RD")), factor(meta.testing.pcr), positive = "pCR")
+densityplot(logregTest.predict[,"pCR"])
+```
+
+## 3.2 Contrastive learning model
+### Pre-processing
+
+```{r}
+# retrieve pCR info
+meta.training.pcr <- ifelse(meta.training$pCR == 0, "RD", "pCR")
+meta.testing.pcr <- ifelse(meta.testing$pCR == 0, "RD", "pCR")
+
+featuresTrainingPy = r_to_py(features.training) # stored in r.() when calling from python
+featuresTestingPy = r_to_py(features.testing)
+metaTrainingPy = r_to_py(meta.training)
+metaTestingPy = r_to_py(meta.testing)
+```
+
+```{python}
+# retrieve pCR / RD labels (series from pd dataframe)
+metaTrainingLabels = r.metaTrainingPy["pCR"]
+metaTestingLabels = r.metaTestingPy["pCR"]
+
+# set seed
+def set_seed(seed):
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available(): # only CPU is used here, added in case of something
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+# reset model weights
+def reset_weights(model):
+    for layer in model.children():
+        if hasattr(layer, 'reset_parameters'):
+            layer.reset_parameters()
+```
+
+### Create contrastive pairs
+
+```{python}
+def create_pairs(features: pd.DataFrame, labels: pd.Series, n_pairs_per_class, seed=1343):
+    set_seed(seed)
+
+    pos_pairs = []
+    neg_pairs = []
+    pos_labels = [] # 1 for a positive pair
+    neg_labels = [] # 0 for a negative pair
+    anchor_labels = [] # class information
+
+    # index from metadata
+    pcr_idx = np.where(labels == 1)[0]
+    rd_idx = np.where(labels == 0)[0]
+
+    # positive pairs: pCR+pCR
+    for _ in range(n_pairs_per_class):
+        pair = np.random.choice(pcr_idx, 2, replace=True)
+        pos_pairs.append((features[pair[0]], features[pair[1]]))
+        pos_labels.append(1)
+        anchor_labels.extend([1, 1])
+    # negative pairs: pCR + RD
+    for _ in range(n_pairs_per_class):
+        pcr_sample = np.random.choice(pcr_idx, 1, replace=True)[0]
+        rd_sample = np.random.choice(rd_idx, 1, replace=True)[0]
+        neg_pairs.append((features[pcr_sample], features[rd_sample]))
+        neg_labels.append(0)
+        anchor_labels.extend([1, 0])
+
+    # combine positive and negative pairs
+    all_pairs = pos_pairs + neg_pairs
+    anchor_list = [pair[0] for pair in all_pairs] # a "pair" object contains 2 samples
+    pair_list = [pair[1] for pair in all_pairs]
+
+    # convert to tensors
+    anchor_tensor = torch.tensor(np.stack(anchor_list), dtype=torch.float32)
+    pair_tensor = torch.tensor(np.stack(pair_list), dtype=torch.float32)
+    labels_tensor = torch.tensor(pos_labels + neg_labels, dtype=torch.float32)
+    sample_labels_tensor = torch.tensor(anchor_labels, dtype=torch.int64)
+
+    return {
+        'anchor': anchor_tensor,           # shape: [2 * n_pos + n_neg, feat_dim]
+        'pair': pair_tensor,
+        'labels': labels_tensor,           # pair label info
+        'sampleLabels': sample_labels_tensor  # pCR/RD info
+    }
+```
+
+```{python}
+# function calling
+contrastive_pairs = create_pairs(features = r.featuresTrainingPy.to_numpy(), labels = metaTrainingLabels.to_numpy(), n_pairs_per_class = 100)
+
+# create dataset and dataloader
+class ContrastivePairDataset(Dataset):
+    def __init__(self, pair_data):
+        self.anchor = pair_data['anchor']
+        self.pair = pair_data['pair']
+        self.labels = pair_data['labels']
+        self.sample_labels = pair_data['sampleLabels']
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        return {
+            'anchor': self.anchor[idx],
+            'pair': self.pair[idx],
+            'label': self.labels[idx],
+            'sample_label': self.sample_labels[idx]
+        }
+
+dataset = ContrastivePairDataset(contrastive_pairs)
+loader = DataLoader(dataset, batch_size=len(dataset), shuffle=True)
+
+# check
+print(len(dataset))
+print(dataset[0]) # 4 objects: anchor + pair + label + sample label
+print(dataset[0]['anchor'].shape) # [28] features
+
+for batch in loader:
+    print(batch.keys())
+    break
+```
+
+### Design model architecture
+
+```{python}
+# neural network
+class contrastive_neural(nn.Module):
+    def __init__(self, Dinput, Dembedding, p_drop):
+        super().__init__()
+        self.fc1 = nn.Linear(Dinput, 64, bias = True)
+        self.act1 = nn.ReLU()
+        self.norm1 = nn.LayerNorm(64)
+        
+        self.dropout = nn.Dropout(p=p_drop)
+        
+        self.fc2 = nn.Linear(64, 128)
+        self.act2 = nn.ReLU()
+        self.norm2 = nn.LayerNorm(128)
+        
+        self.fc3 = nn.Linear(128, Dembedding)
+        
+    def forward(self, x):
+        x = self.norm1(self.act1(self.fc1(x)))
+        x = self.norm2(self.act2(self.fc2(x)))
+        x = self.dropout(x)
+        x = F.normalize(x, dim=1)
+        x = self.fc3(x)
+        x = F.normalize(x, dim=1)
+        return x
+
+# instantiating model
+ContrastiveModel = contrastive_neural(Dinput=20, Dembedding=16, p_drop = 0.2)
+```
+
+```{python}
+# setting initial weights
+set_seed(1343)
+reset_weights(ContrastiveModel)
+
+# model based on initial weights
+ContrastiveModel = contrastive_neural(Dinput=20, Dembedding=16, p_drop = 0.2)
+```
+
+```{python}
+# define loss function
+# original reference: https://jamesmccaffrey.wordpress.com/2022/02/17/contrastive-loss-function-in-pytorch/contrastive_loss_research_paper/
+def contrastive_loss(x1, x2, y, margin=4.0):
+    dist = F.pairwise_distance(x1, x2) # euclidean distance
+
+    # loss by label (1 = similar, 0 = different)
+    loss_similar = 0.5 * y * dist.pow(2) # similar pair contributes to loss -> minimize distance
+    loss_dissimilar = 0.5 * (1-y) * F.relu(margin - dist).pow(2) # < margin contributes to loss, minimize distance = push distance towards margin
+
+    # final loss of a pair
+    return (loss_similar + loss_dissimilar).mean()
+
+# define optimizer structure
+optimizer = optim.Adam(ContrastiveModel.parameters(),  # point to model parameters to optimize
+                        lr = 1e-4, # default learning rate
+                        weight_decay = 1e-4 # gradually reduces learning rate, prevent overfitting
+                        )
+```
+
+### Training loop
+
+```{python}
+# parameters
+num_epochs = 1000
+loss_history = []
+
+# training
+for epoch in range(num_epochs+1):
+    ContrastiveModel.train()
+    epoch_loss = 0.0
+    num_batches = 0
+
+    for batch in loader:
+        anchor = batch['anchor'].float() # extract samples as a list
+        pair = batch['pair'].float()
+        label = batch['label'].float()
+
+        # forward pass
+        x1 = ContrastiveModel(anchor)
+        x2 = ContrastiveModel(pair)
+
+        # calculate loss
+        loss = contrastive_loss(x1, x2, y = label, margin=2.0)
+        epoch_loss += loss.item()
+        num_batches += 1
+
+        # backprop
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
+    avg_loss = epoch_loss / num_batches
+    loss_history.append(avg_loss)
+    print(f"Epoch {epoch+1}/{num_epochs} - Avg Loss: {avg_loss:.4f}")
+
+# plot loss change
+plt.clf() # clear figure memory, prevent generating multiple loss logs
+plt.plot(range(1, len(loss_history)+1), loss_history, linestyle='-', marker=None)
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('Training Loss over Epochs')
+plt.grid(False)
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+# visualize the separation quality by PCA plot
+ContrastiveModel.eval()
+features_tensor = torch.tensor(r.featuresTrainingPy.values, dtype=torch.float32)
+features_tensor.size() # [142,28]
+
+# turns off gradient tracking
+with torch.no_grad():
+    embeddings_training = ContrastiveModel(features_tensor)#, projection=True)
+    embeddings_training = embeddings_training.numpy() # convert to numpy array for plotting
+
+# visualization
+pca = PCA(n_components=2)
+reduced_embeddings = pca.fit_transform(embeddings_training)
+
+labels = metaTrainingLabels # annotated by real pCR/RD
+
+plt.clf()
+plt.figure(figsize=(8, 6))
+plt.scatter(reduced_embeddings[:, 0], reduced_embeddings[:, 1],
+            c=labels, cmap='coolwarm', alpha=0.8)
+plt.title("PCA of Embeddings (annotated by true labels)")
+plt.xlabel("PC1")
+plt.ylabel("PC2")
+plt.grid(False)
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+# annotated by pair labels
+features_tensor_paired = contrastive_pairs['pair'].float() # RD cases = negative pairs
+features_tensor_paired.size() # [200,20]
+
+with torch.no_grad():
+    embeddings_training_paired = ContrastiveModel(features_tensor_paired)#, projection=True)
+    embeddings_training_paired = embeddings_training_paired.numpy() # convert to numpy array for plotting
+    
+# visualization
+pca = PCA(n_components=2)
+reduced_embeddings_paired = pca.fit_transform(embeddings_training_paired)
+
+labels_pair = contrastive_pairs["labels"].numpy()  # annotated by +ve/-ve pairs
+
+plt.clf()
+plt.figure(figsize=(8, 6))
+plt.scatter(reduced_embeddings_paired[:, 0], reduced_embeddings_paired[:, 1],
+            c=labels_pair, cmap='coolwarm', alpha=0.8)
+plt.title("PCA of Embeddings (annotated by pair labels)")
+plt.xlabel("PC1")
+plt.ylabel("PC2")
+plt.grid(False)
+plt.tight_layout()
+plt.show()
+```
+
+### Train downstream classifier
+
+```{python}
+# pytorch lightning: logistic regression implementation
+class DownstreamClassifier(pl.LightningModule):
+    # ===================== setting up model =======================
+    def __init__(self, encoder, embedding_dim, num_classes, lr=1e-3, weight_decay=1e-5, max_epochs=200):
+        super().__init__()
+        self.save_hyperparameters(ignore=['encoder']) # save hyperparameters for auto-log
+        self.encoder = encoder  # pre-trained embedder model
+        self.classifier = nn.Linear(embedding_dim, num_classes) # add classification layer
+    def forward(self, x):
+        with torch.no_grad():
+             embeddings = self.encoder(x)
+        #embeddings = self.encoder(x) # unfreeze fine-tune
+        logits = self.classifier(embeddings)
+        return logits
+    
+    # ============ optimize model in lightning module ==================
+    def configure_optimizers(self):
+        optimizer = optim.Adam(self.parameters(),
+                                lr=self.hparams.lr, # pull values from saved parameters
+                                weight_decay=self.hparams.weight_decay)
+        # at 60%/80% of training, decrease learning rate
+        scheduler = optim.lr_scheduler.MultiStepLR(optimizer,
+                                                   milestones=[int(self.hparams.max_epochs*0.6),
+                                                               int(self.hparams.max_epochs*0.8)],
+                                                   gamma=0.1)
+        return [optimizer], [scheduler]
+
+    # ================= training and evaluation ==================
+    def _shared_step(self, batch, mode='train'):
+        x = batch['anchor']    
+        y = batch['sample_label'] # true label
+
+        with torch.no_grad():
+            embeddings = self.encoder(x) # call embedder model
+        logits = self.classifier(embeddings) # call classifier model
+        loss = F.cross_entropy(logits, y) # calculate loss
+        self.log(f'{mode}_loss', loss, prog_bar=True) # print values
+        return loss
+
+    def training_step(self, batch, batch_idx):
+        return self._shared_step(batch, mode='train')
+```
+
+```{python}
+ContrastiveModel.eval()
+
+# calling to train
+classifier = DownstreamClassifier(
+  encoder=ContrastiveModel,
+  embedding_dim=16,
+  num_classes=2,
+  lr=1e-3,
+  weight_decay=1e-5,
+  max_epochs=200
+)
+
+trainer = pl.Trainer(max_epochs=200)
+trainer.fit(classifier, loader)
+```
+
+```{python}
+# check architecture
+print(classifier)
+
+# PCA
+classifier.eval()
+
+with torch.no_grad():
+    classification_training = classifier(features_tensor)
+    classification_training = classification_training.numpy()
+
+# visualization
+pca = PCA(n_components=2)
+reduced_classification = pca.fit_transform(classification_training)
+
+labels = metaTrainingLabels # annotated by real pCR/RD
+
+plt.clf()
+plt.figure(figsize=(8, 6))
+plt.scatter(reduced_classification[:, 0], reduced_classification[:, 1],
+            c=labels, cmap='coolwarm', alpha=0.8)
+plt.title("PCA of classification (annotated by true labels)")
+plt.xlabel("PC1")
+plt.ylabel("PC2")
+plt.grid(False)
+plt.tight_layout()
+plt.show()
+```
+
+### Evaluating performance on validation set
+
+```{python}
+# softmax activation to get class probabilities
+classifier.eval()
+
+with torch.no_grad():
+    logits = classifier(features_tensor)
+    probs = F.softmax(logits, dim=1)
+    probs = probs.numpy()
+
+pcr_probs = probs[:,1]
+```
+
+```{python}
+# prediction in testing set
+testing_tensor = torch.tensor(r.featuresTestingPy.to_numpy(), dtype=torch.float32)
+classifier.eval()
+
+with torch.no_grad():
+    logitsTesting = classifier(testing_tensor)
+    probsTesting = F.softmax(logitsTesting, dim=1)
+    probsTesting = probsTesting.numpy()
+
+pcr_probsTesting = probsTesting[:,1]
+```
+
+```{r}
+cl_vec <- py$pcr_probsTesting
+plot(density(cl_vec))
+cl_class <- ifelse(cl_vec>0.5, "pCR","RD")
+
+# plot ROC curve
+par(pty = "s")
+roc(factor(meta.testing.pcr), cl_vec,levels = c("RD","pCR"), direction = "<",
+    plot = T, asp = NA, col = "royalblue", lwd = 2, legacy.axes = T, print.auc = T,
+    main = "ROC curve for CL model in ISPY2 Ctr cohort") # 0.65
+confusionMatrix(factor(cl_class), factor(meta.testing.pcr), positive = "pCR") # 0.57, 0.7
+```
+
+### Calculte SHAP value
+
+```{python}
+# freeze model
+classifier.eval()
+for param in classifier.parameters():
+    param.requires_grad = False
+
+# wrapper
+def CL_pipeline(input_np):
+    input_tensor = torch.tensor(input_np, dtype=torch.float32)
+    with torch.no_grad():
+        emb = classifier(input_tensor)
+        probs = F.softmax(emb, dim=1)
+    return probs[:, 1].cpu().numpy()
+
+# SHAP explainer
+background = shap.sample(r.featuresTrainingPy.to_numpy(), 100)
+explainer = shap.KernelExplainer(CL_pipeline, background)
+
+# compute SHAP values
+shap_values = explainer(r.featuresTestingPy.to_numpy())
+shap_values.feature_names = r.featuresTestingPy.columns.tolist()
+
+# visualization
+plt.clf()
+fig = plt.figure(figsize=(10, 8), constrained_layout=True)
+shap.plots.bar(shap_values, max_display = 20)
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+# save neural network model (weights)
+torch.save(classifier.state_dict(), '/Users/jleng/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/InProgress/ContrastiveLearningTrainedClassifier_extraLayer_ISPY2CtrTrain_frozen')
+
+# save prediction
+saveRDS(py$pcr_probsTesting, "~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/contrastiveLearningPrediction.rds")
+
+# save SHAP value
+py_run_string("
+shap_df = pd.DataFrame(shap_values.values, columns=shap_values.feature_names)
+shap_df.to_csv('~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/contrastiveLearningSHAPvalues.csv', index=False)
+")
+```
+
+## 3.3 Ensemble model
+
+```{r}
+# loading saved data
+cl_vec <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/contrastiveLearningPrediction.rds")
+```
+
+```{r}
+# training model by selected algorithms
+logreg_control <- trainControl(method = "repeatedcv",
+                            number = 10,
+                            repeats = 5,
+                            classProbs = T,
+                            summaryFunction = twoClassSummary,
+                            savePredictions = "final"
+                            )
+logregFit.logitboost <- train(x = features.training,
+                y = factor(meta.training.pcr),
+                method = "LogitBoost",
+                metric = "ROC",
+                trControl = logreg_control,
+                )
+logregFit.nb <- train(x = features.training,
+                y = factor(meta.training.pcr),
+                method = "naive_bayes",
+                metric = "ROC",
+                trControl = logreg_control,
+                )
+```
+
+### Majority voting
+
+```{r}
+# prediction
+logregLogitBoost.predict <- predict(logregFit.logitboost, features.testing, type = "prob")
+logregNB.predict <- predict(logregFit.nb, features.testing, type = "prob")
+cl_class <- ifelse(cl_vec>0.5, "pCR","RD")
+
+# mean probability (for calculating AUC)
+averagedPrediction <- matrix(nrow = nrow(features.testing), ncol = 1)
+rownames(averagedPrediction) <- rownames(features.testing)
+colnames(averagedPrediction) <- "pCR"
+for(i in 1:nrow(averagedPrediction)) {
+  averagedPrediction[i,1] <- mean(c(logregLogitBoost.predict[i,1],
+                                    logregNB.predict[i,1],
+                                    cl_vec
+                                    ))
+}
+averagedPrediction[1:5,]
+
+# majority voting (> 2 pCR = pCR)
+finalPrediction_voted <- as.data.frame(matrix(nrow = nrow(meta.testing), ncol = 4
+                                              ))
+rownames(finalPrediction_voted) <- rownames(features.testing)
+colnames(finalPrediction_voted) <- c("LogitBoost","NB","CL","Final")
+
+finalPrediction_voted$LogitBoost <- ifelse(logregLogitBoost.predict[,"pCR"] > 0.5, "pCR", "RD")
+finalPrediction_voted$NB <- ifelse(logregNB.predict[,"pCR"] > 0.5, "pCR", "RD")
+finalPrediction_voted$CL <- cl_class
+
+for(i in 1:length(meta.testing.pcr)) {
+  ifelse(sum(finalPrediction_voted[i,1:3] == "pCR") >= 2, 
+         finalPrediction_voted$Final[i] <- "pCR", finalPrediction_voted$Final[i] <- "RD")
+}
+finalPrediction_voted[1:5,]
+
+# performance
+par(pty = "s")
+roc(factor(meta.testing.pcr), averagedPrediction[,"pCR"],levels = c("RD","pCR"), direction = "<",
+    plot = T, asp = NA, col = "royalblue", lwd = 2, legacy.axes = T, print.auc = T,
+    main = "ROC curve for Majority Voting model in ISPY2 Ctr cohort") # 0.76
+confusionMatrix(factor(finalPrediction_voted$Final), factor(meta.testing.pcr)) # 0.7, 0.9
+```
+
+### Calculate SHAP value
+
+```{r}
+# wrapper
+pred_wrapper <- function(object, newdata) {
+  predict(object, newdata, type = "prob")[,"pCR"]
+}
+
+# calculate SHAP value
+shap.logitboost <- vi_shap(logregFit.logitboost, 
+                    feature_names = colnames(features.training),
+                           train = features.training,
+                           nsim = 50, 
+                           pred_wrapper = pred_wrapper
+                           )
+shap.nb <- vi_shap(logregFit.nb, 
+                    feature_names = colnames(features.training),
+                           train = features.training,
+                           nsim = 50, 
+                           pred_wrapper = pred_wrapper
+                           )
+```
+
+```{r}
+# save prediction probabilities
+saveRDS(averagedPrediction[,"pCR"], "~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/majorityVotingModelPrediction.rds")
+saveRDS(logregLogitBoost.predict[,"pCR"], "~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/LogitBoostPrediction_ISPY2CtrlTest.rds")
+saveRDS(logregNB.predict[,"pCR"], "~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/NBPrediction_ISPY2CtrlTest.rds")
+
+# save SHAP values
+saveRDS(shap.logitboost, "~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/logitboostSHAPvalues.rds")
+saveRDS(shap.nb, "~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/naivebayesSHAPvalues.rds")
+
+# save model
+saveRDS(logregFit.logitboost, "~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/InProgress/MajorityVotingModel_LogitBoost")
+saveRDS(logregFit.nb, "~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/InProgress/MajorityVotingModel_NaiveBayes")
+```
+
+## 3.4 Benchmark model comparison
+
+### Extract pre-defined features
+
+```{r}
+# loading saved data
+rna.expression <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/ISPY2/ProcessedCtrlData/rna.expression.ctr")
+meta.training <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/ISPY2/ProcessedCtrlData/meta.training_2")
+meta.testing <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/ISPY2/ProcessedCtrlData/meta.testing_2")
+features.receptorStatus <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/ISPY2/ProcessedCtrlData/features.receptorStatus")
+```
+
+```{r}
+# GGI score
+# enrichment on GGI gene set (measure of histological tumor grade)
+GGIset <- list(GGIpathway = c("ASPM", "AURKA", "AURKB", "BBS1", "BIRC5", "BLM", "BUB1", "BUB1B", "JHY", "RAB5IF", "CCNA2", "CCNB1", "CCNB2", "CCNE2", "CCT5", "CDC20", "CDC25A", "CDCA3", "CDCA8", "CDK2", "CDKN3", "CENPA", "CENPE", "CENPF", "CENPN", "CEP55", "CX3CR1", "CYBRD1", "DONSON", "ESPL1", "EXO1", "PIMREG", "FEN1", "FOXM1", "FRY", "GMPS", "GTSE1", "H2AFZ", "HMGB3", "HMMR", "IFT88", "KIF11", "KIF14", "KIF15", "KIF20A", "KIF2C", "KIF4A", "KIFC1", "KPNA2", "LAMB2", "LMNB1", "MAD2L1", "MARS", "MCM10", "MCM2", "MCM4", "MELK", "MKI67", "MYBL2", "NCAPG", "NCAPH", "NUDT1", "NUSAP1", "OIP5", "ORMDL2", "PIGV", "PLK1", "POLQ", "PRC1", "PTTG1", "RACGAP1", "RNASEH2A", "RRM2", "SESN1", "SHMT2", "SIRT3", "SLC7A5", "SPAG5", "STARD13", "TIMELESS", "TPT1", "TPX2", "TRIP13", "TROAP", "TTK", "UBE2C", "UBE2N", "UBE2S", "WDR19", "ZWINT"))
+
+GGI.gsva <- gsva(rna.expression, GGIset,
+                 method = "ssgsea", # sample level analysis
+                 verbose = T)
+```
+
+```{r}
+# ESC score
+# enrichment on embryonic stem cell gene set (download from GSEA website) 
+ESCset <- list(ESCpathway = c("ABCB7", "ACAD8", "ADH5", "ADSL", "AK4", "ALDH7A1", "ALDOC", "AMOTL2", "ANP32E", "APEX1", "ATP5PF", "ATP5PO", "AURKA", "AURKB", "BANF1", "BAX", "BCAT1", "BIRC5", "BLM", "BRIX1", "BTF3", "BUB1", "BUB1B", "BUB3", "CBX3", "CCNA2", "CCNB2", "CCNC", "CCND1", "CCND2", "CCNF", "CCT5", "CDC20", "CDC34", "CDC6", "CDC7", "CDCA3", "CDCA5", "CDCA7", "CDCA8", "CDK1", "CDK4", "CDKN1C", "CDKN3", "CHAF1A", "CHEK1", "CHEK2", "CISD1", "CKAP2", "CKS1B", "CKS2", "CLPP", "COQ3", "COX5B", "CRABP2", "CSE1L", "CSRP2", "CTNNA1", "CTSC", "CYCS", "DAP3", "DARS2", "DBF4", "DDX18", "DEK", "DHX9", "DLAT", "DLGAP5", "DNMT1", "DPP3", "DTL", "DTYMK", "E2F3", "EBNA1BP2", "ECHS1", "EEF1E1", "EEF2", "EIF2S2", "EIF2S3", "EIF3A", "EIF3I", "EIF3K", "EIF3L", "EIF4A1", "EIF4B", "EIF4EBP1", "EIF6", "ELOVL6", "EMC8", "ENO1", "ERCC6L", "ERP29", "ETFA", "EXO1", "EXOSC7", "FAM136A", "FARSA", "FBL", "FDPS", "FGFR1", "FH", "G3BP1", "GARS1", "GART", "GEMIN2", "GEMIN6", "GJA1", "GLDC", "GLO1", "GMNN", "GNA14", "GNL3", "GNPDA1", "GSPT2", "GTSE1", "HADH", "HAT1", "HAUS1", "HDAC1", "HELLS", "HMGB2", "HMGN5", "HNRNPA1", "HNRNPAB", "HNRNPK", "HNRNPL", "HSPA14", "HSPA9", "HSPE1", "IARS1", "IPO9", "JPT1", "KGD4", "KIF11", "KIF20A", "KIF22", "KIF23", "KIF4A", "KPNA2", "KPNA6", "KRAS", "LBHD1", "LMNB1", "LSM10", "LSM2", "LSM4", "LSM5", "LYPLA1", "MAD2L1", "MAIP1", "MAPK13", "MCM2", "MCM3", "MCM4", "MCM5", "MCM7", "MID1IP1", "MRPL11", "MRPL12", "MRPL13", "MRPL15", "MRPL16", "MRPL37", "MRPL39", "MRPL4", "MRPS17", "MRPS18B", "MRPS2", "MRPS28", "MRPS30", "MRTO4", "MSH2", "MTF2", "MTHFD2", "MYBL2", "MYC", "NAP1L1", "NASP", "NCAPD2", "NCAPH", "NCBP2", "NCL", "NDC80", "NDUFA11", "NDUFA9", "NDUFAB1", "NDUFB10", "NDUFB7", "NDUFB8", "NDUFS2", "NEK2", "NHP2", "NIFK", "NIP7", "NIPSNAP1", "NLN", "NME2", "NME4", "NONO", "NOP10", "NOP2", "NT5DC2", "NTHL1", "NUDCD2", "NUP107", "NUSAP1", "ORC1", "OTX2", "PA2G4", "PABPC1", "PARP1", "PCNA", "PDCD2", "PDHA1", "PDIA4", "PDPN", "PHB1", "PHC1", "PHF5A", "PIPOX", "PLK1", "PLK4", "POLD1", "POLE2", "POLR2F", "POLR3K", "POP7", "PPM1G", "PPP4C", "PRDX1", "PRIM1", "PRIM2", "PRMT1", "PRMT3", "PROM1", "PRPS1", "PSMA5", "PSMA7", "PSMB5", "PSMB6", "PSMD14", "PSME3", "PUS1", "RAB34", "RACGAP1", "RAD18", "RAD23B", "RCC1", "RCC2", "RCN2", "RFC3", "RNPS1", "RPA2", "RPA3", "RPL10A", "RPL13", "RPL22", "RPL27A", "RPP40", "RPS12", "RPS16", "RPS19", "RPS23", "RPS27", "RPS3", "RPS5", "RPS8", "RPSA", "RRM1", "RRM2", "RUVBL1", "RUVBL2", "SARS1", "SDHC", "SDHD", "SEPHS2", "SERPINH1", "SET", "SINHCAF", "SLC16A1", "SLC25A5", "SLC2A1", "SMC2", "SMC4", "SNRNP40", "SNRPA", "SNRPA1", "SNRPD1", "SNX5", "SOX2", "SPAG5", "SQLE", "SRSF10", "SS18", "SSB", "STIP1", "STOML2", "SUMO1", "TCF19", "TCF7L1", "TCOF1", "TEAD2", "TERF1", "TGIF1", "TGIF2", "THOC3", "TIMM13", "TIMM44", "TIMM8A", "TIMM8B", "TMEFF1", "TOP2A", "TP53", "TRIP13", "TRIP6", "TTK", "U2AF1", "UBE2G1", "UBE2V2", "UGDH", "UQCR11", "UQCRH", "UTP18", "VBP1", "VRK1", "WBP11", "WDHD1", "WDR77", "WEE1", "XPO1", "XRCC5", "YAP1", "YY1", "ZIC3", "ZNF22"
+))
+
+ESC.gsva <- gsva(rna.expression, ESCset, method = "ssgsea", verbose = T)
+```
+
+```{r}
+# Taxane score
+# Difference in expression of: (1) mitotic metagene (geometric mean of BUB1B, CDK1, AURKB and TTK TPM expression) and  (2) ceramide metagene (geometric mean of UGCG and CERT1 expression)
+
+mitotic_metagene <- c("BUB1B", "CDK1", "AURKB", "TTK")
+ceramide_metagene <- c("UGCG", "CERT1")
+mitotic_expr <- rna.expression[mitotic_metagene, , drop = FALSE]
+ceramide_expr <- rna.expression[ceramide_metagene, , drop = FALSE]
+
+# geometric mean
+geom_mean <- function(x) {
+  exp(mean(log(x + 1e-6)))  # small pseudocount to avoid log(0)
+}
+mitotic_meta <- apply(mitotic_expr, 2, geom_mean)
+ceramide_meta <- apply(ceramide_expr, 2, geom_mean)
+Taxane.score <- mitotic_meta - ceramide_meta
+```
+
+```{r}
+# STAT1 score
+# a gene signature representing immune response (retrieved from original paper)
+STAT1set <- list(STAT1pathway = c("STAT1", "CXCL10", "TAP1", "CXCL11", "INDO", "CXCL9", "MX1", "LAMP3", "ISG15", "RTP4", "HERC6", "IFI44L", "MX2", "IFIT3", "HERC5", "RSAD2", "DDX58", "CCL5", "ADAMDEC1", "CD2", "NA", "HCP5", "NMI", "SPOCK2", "CCL8", "TRIM22", "LYZ", "IRF1", "LAG3", "PSCDBP", "TFEC", "UBD", "SP140", "CTSC", "IFI6", "PLA2G7", "CD3G", "ECGF1", "PLAC8", "FGL2", "GZMK", "CD48", "STAT4", "GPR18", "P2RX5", "IFI30", "SH2D1A", "LAPTM5", "CD69", "PTPN7", "IRF8", "PIM2", "ETV7", "GPR171", "PSME1", "BIRC3", "FASLG", "IFITM1", "IFIT5", "ITGB2", "BTN3A2", "HCLS1", "SECTM1", "ARHGAP15", "KLRK1", "IGSF6", "EBI2", "NA", "SNX10", "NA", "BST2", "NA", "APOC1", "NA", "NA", "ZC3HAV1", "DDAH2", "LILRA4", "EBI3", "KLRC3", "CLEC4A", "CD40LG", "VAV1", "GLRX", "ACP5", "RFX5", "CECR1", "TRAF3", "RAB8A", "IL18", "EFNA1", "RASGRP1", "REC8L1", "CCRL2", "DNAL4"))
+
+STAT1_score <- gsva(rna.expression, STAT1set, method = "ssgsea", verbose = T)
+```
+
+```{r}
+# Cytolytic score
+# Geometric mean of GZMA and PRF1
+cytolytic_metagene <- c("GZMA","PRF1")
+cytolytic_expr <- rna.expression[cytolytic_metagene, , drop = FALSE]
+cytolytic_meta <- apply(cytolytic_expr, 2, geom_mean)
+```
+
+```{r}
+# TIDE
+# FPKM normalization
+# gene length data
+length_genes_data <- read.delim("~/clinical-trial-ml/resources/Homo_sapiens.GRCh37.87.genelength.txt")
+
+# Add Symbol column to the genes length dataframe
+geneSymbols <- na.omit(data.frame('Symbol' = mapIds(org.Hs.eg.db, keys=length_genes_data$gene, column="SYMBOL", keytype="ENSEMBL", multiVals="first")))
+geneSymbols$ENSEMBL <- rownames(geneSymbols)
+length_genes <- merge(length_genes_data, geneSymbols, by.y = 'ENSEMBL', by.x = 'gene')
+rownames(length_genes) <- make.unique(length_genes$Symbol)
+
+# Match expression data and gene lengths
+intersectgenes <- intersect(length_genes$Symbol, rownames(rna.expression))
+rna.expression <- rna.expression[intersectgenes, ]
+length_genes <- length_genes[intersectgenes, ]
+stopifnot(all(length_genes$Symbol == rownames(rna.expression))) # Check genes are properly matched
+
+# FPKM
+y <- DGEList(counts = rna.expression, genes = length_genes) # skip filter
+y <- calcNormFactors(y, method = "TMM")
+FPKM <- rpkm(y, normalized.lib.sizes = T, gene.length = "length")
+
+# log2(x+1) - row means transformation
+logFPKM.rna.expression <- log2(FPKM + 1)
+logFPKM.rna.expression <- logFPKM.rna.expression - rowMeans(logFPKM.rna.expression)
+write.table(logFPKM.rna.expression, "~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/logs/rnaCtrlISPY2_fpkm.tsv", row.names = T, sep = "\t", quote = F)
+
+# running TIDE (from command-line interface)
+# pip install tidepy
+# tidepy -o rnaCtrlISPY2_fpkm_TIDE -c Other rnaCtrlISPY2_fpkm.tsv
+
+# move result to output folder
+# mv rnaCtrlISPY2_fpkm_TIDE ~/Library/CloudStorage/OneDrive-TheInstituteofCancerResearch/Jing_ClinicalTrialML_Data/output/logs/
+
+tide.output <- read.delim("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/logs/rnaCtrlISPY2_fpkm_TIDE", header = T, sep = "\t", row.names = 1)
+
+dysfuncExclusive.score <- tide.output[,c("Dysfunction","Exclusion")]
+```
+
+```{r}
+# Mast cell score
+# deconvolution by MCP-counter
+Danaher_signature <- list(mastCells = signature_collection$Mast_cells_Danaher_et_al)
+mast.score <- gsva(rna.expression, Danaher_signature, method = "ssgsea", verbose = T)
+```
+
+```{r}
+# match all data
+GGI <- as.data.frame(t(GGI.gsva))
+ESC <- as.data.frame(t(ESC.gsva))
+Taxane <- as.data.frame(Taxane.score)
+STAT1 <- as.data.frame(t(STAT1_score))
+cytolytic <- as.data.frame(t(cytolytic_expr))
+mastDanaher <- as.data.frame(t(mast.score))
+stopifnot(rownames(GGI) == rownames(cytolytic))
+dysfuncExclusive <- dysfuncExclusive.score[match(rownames(GGI),rownames(dysfuncExclusive.score)),]
+
+# combine and split
+featuresALL <- cbind(GGI,ESC,Taxane,STAT1,cytolytic,dysfuncExclusive,mastDanaher)
+features.training <- featuresALL[rownames(featuresALL) %in% rownames(meta.training),]
+features.testing <- featuresALL[rownames(featuresALL) %in% rownames(meta.testing),]
+features.training <- features.training[match(rownames(meta.training),rownames(features.training)),]
+features.testing <- features.testing[match(rownames(meta.testing),rownames(features.testing)),]
+stopifnot(rownames(features.training) == rownames(meta.training))
+
+# add receptor subtypes
+scale.backup <- scale(features.receptorStatus[,1])
+for(i in 1:ncol(features.receptorStatus)) {
+  features.receptorStatus[,i] <- scale(features.receptorStatus[,i])
+}
+stopifnot(sum(scale.backup != features.receptorStatus[,1]) == 0)
+boxplot(features.receptorStatus)
+
+# split by training / testing index in expression markers
+features.receptorStatus.train <- features.receptorStatus[rownames(features.receptorStatus) %in% rownames(meta.training), ]
+features.receptorStatus.test <- features.receptorStatus[rownames(features.receptorStatus) %in% rownames(meta.testing), ]
+
+# match features with metadata
+features.receptorStatus.train <- features.receptorStatus.train[match(rownames(meta.training), rownames(features.receptorStatus.train)),]
+features.receptorStatus.test <- features.receptorStatus.test[match(rownames(meta.testing), rownames(features.receptorStatus.test)),]
+stopifnot(sum(rownames(features.receptorStatus.train) != rownames(meta.training)) == 0)
+
+# combine features to generate final feature set
+features.training <- cbind(features.training, as.matrix(features.receptorStatus.train))
+features.testing <- cbind(features.testing, as.matrix(features.receptorStatus.test))
+boxplot(features.training)
+dim(features.training) # 12 features in total
+
+# save new features
+saveRDS(features.training, "~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/logs/RNAfeaturesTrain9_new")
+saveRDS(features.testing, "~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/logs/RNAfeaturesTest9_new")
+```
+
+### Train RNA benchmark model
+
+```{r}
+# prepare pandas dataframe
+featuresTrainingPy = r_to_py(features.training) # stored in r.() when calling from python
+featuresTestingPy = r_to_py(features.testing)
+metaTrainingPy = r_to_py(meta.training)
+metaTestingPy = r_to_py(meta.testing)
+```
+
+```{python}
+# select K best features using SelectKBest func
+class SelectAtMostKBest(SelectKBest):
+    def _check_params(self, X, y):
+        if not (self.k == "all" or 0 <= self.k <= X.shape[1]):
+            # set k to "all" (skip feature selection), if less than k features are available
+            self.k = "all"
+
+# drop collinear features
+class DropCollinear(BaseEstimator, TransformerMixin):
+    def __init__(self, thresh):
+        self.uncorr_columns = None
+        self.thresh = thresh
+
+    def fit(self, X, y):
+        cols_to_drop = []
+
+        # Find variables to remove
+        X_corr = X.corr()
+        large_corrs = X_corr>self.thresh
+        indices = np.argwhere(large_corrs.values)
+        indices_nodiag = np.array([[m,n] for [m,n] in indices if m!=n])
+
+        if indices_nodiag.size>0:
+            indices_nodiag_lowfirst = np.sort(indices_nodiag, axis=1)
+            correlated_pairs = np.unique(indices_nodiag_lowfirst, axis=0)
+            resp_corrs = np.array([[np.abs(spearmanr(X.iloc[:,m], y).correlation), np.abs(spearmanr(X.iloc[:,n], y).correlation)] for [m,n] in correlated_pairs])
+            element_to_drop = np.argmin(resp_corrs, axis=1)
+            list_to_drop = np.unique(correlated_pairs[range(element_to_drop.shape[0]),element_to_drop])
+            cols_to_drop = X.columns.values[list_to_drop]
+
+        cols_to_keep = [c for c in X.columns.values if c not in cols_to_drop]
+        self.uncorr_columns = cols_to_keep
+
+        return self
+
+    def transform(self, X):
+        return X[self.uncorr_columns]
+
+    def get_params(self, deep=False):
+        return {'thresh': self.thresh}
+
+# give cv splits (tr + ts)
+def defineSplits(X,ycateg,random_state):
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=int(random_state))
+    splits = []
+    for (tr,ts) in cv.split(X, ycateg):
+        splits.append((tr,ts))
+    return splits
+
+```
+
+```{python}
+# logistic regression
+def optimise_logres_featsel(X, y, cut, cv=5, metric='roc_auc'):
+    # Pipeline components
+    scaler = StandardScaler() # scale all features
+    kbest = SelectAtMostKBest(score_func=f_classif) # compute the ANOVA F-value, return score&p-val
+    dropcoll = DropCollinear(cut) # drop features above cut threshold
+    logres = LogisticRegression(random_state=1, penalty='elasticnet', solver='saga', max_iter=10000, n_jobs=-1, class_weight=None)
+    pipe = Pipeline(steps=[('dropcoll', dropcoll), ('scaler', scaler), ('kbest', kbest), ('logres', logres)])
+    
+    # Parameter ranges
+    param_grid = { 'kbest__k': np.arange(2,X.shape[1],1),
+                    'logres__C': np.logspace(-3,3,30),
+                    'logres__l1_ratio': np.arange(0.1,1.1,0.1) }
+                    
+    # Optimisation
+    search = RandomizedSearchCV(pipe, param_grid, cv=cv, scoring=metric, return_train_score=True, n_jobs=1, verbose=2, n_iter=1000, random_state=0)
+    search.fit(X,y)
+
+    return search
+```
+
+```{python}
+# SVC
+def optimise_SVC_featsel(X, y, cut, cv=5):
+    # Pipeline components
+    scaler = StandardScaler()
+    kbest = SelectAtMostKBest(score_func=f_classif)
+    dropcoll = DropCollinear(cut)
+    svc = SVC(random_state=1, max_iter=-1, probability=True)
+    pipe = Pipeline(steps=[('dropcoll', dropcoll), ('scaler', scaler), ('kbest', kbest), ('svc', svc)])
+
+    param_grid = { 'kbest__k': np.arange(2,X.shape[1],1),
+                    'svc__kernel': ['rbf','sigmoid','linear'],
+                    'svc__gamma': np.logspace(-9,-2,60),
+                    'svc__C': np.logspace(-3,3,60)}
+
+    # Optimisation
+    search = RandomizedSearchCV(pipe, param_grid, cv=cv, scoring='roc_auc',return_train_score=True, n_jobs=1, verbose=2, n_iter=1000, random_state=0)
+    search.fit(X,y)
+
+    return search
+```
+
+```{python}
+# RF
+def optimise_rf_featsel(X, y, cut, cv=5):
+    # Pipeline components
+    scaler = StandardScaler()
+    kbest = SelectAtMostKBest(score_func=f_classif)
+    dropcoll = DropCollinear(cut)
+    rf = RandomForestClassifier(random_state=1)
+    pipe = Pipeline(steps=[('dropcoll', dropcoll), ('scaler', scaler), ('kbest', kbest), ('rf', rf)])
+    # Parameter ranges
+    param_grid = { 'kbest__k': range(1,X.shape[1]),
+                    "rf__max_depth": [3, None],
+                    "rf__n_estimators": [5, 10, 25, 50, 100],
+                    "rf__max_features": [0.05, 0.1, 0.2, 0.5, 0.7],
+                    "rf__min_samples_split": [2, 3, 6, 10, 12, 15]
+                    }
+    # Optimisation
+    search = RandomizedSearchCV(pipe, param_grid, cv=cv, scoring='roc_auc',return_train_score=True, n_jobs=1, verbose=2,n_iter=1000, random_state=1)
+    search.fit(X,y)
+
+    return search
+```
+
+```{python}
+# model average
+class AveragingModels(BaseEstimator, RegressorMixin, TransformerMixin):
+    def __init__(self, models):
+        self.models = models
+
+    # we define clones of the original models to fit the data in
+    def fit(self, X, y):
+        self.models_ = [clone(x.best_estimator_) for x in self.models]
+
+        # Train cloned base models
+        for model in self.models_:
+            model.fit(X, y)
+
+        return self
+
+    #Now we do the predictions for cloned models and average them
+    def predict_proba(self, X):
+        predictions_0 = np.column_stack([
+            model.predict_proba(X)[:,0] for model in self.models_
+        ])
+
+        predictions_1 = np.column_stack([
+            model.predict_proba(X)[:,1] for model in self.models_
+        ])
+        means_0 = np.mean(predictions_0, axis=1)
+        means_1 = np.mean(predictions_1, axis=1)
+        return np.column_stack([means_0, means_1])
+```
+
+```{python}
+def plot_and_refit(X, y, model, cv,feats='features',ids=None):
+    aucs = []
+    ypreds = []
+    yreals = []
+    ypreds_cv = []
+    yreals_cv = []
+
+    mses = []
+    tprs = []
+    mean_fpr = np.linspace(0, 1, 10) # evenly spaced array
+
+    fout = open('/Users/jleng/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/logs/'+'patpreds_cv_'+feats+'.txt', 'a') # create file for log
+    cv_models = []
+    
+    # cross validation loop
+    for i,(tr,ts) in enumerate(cv): # retrieve data from created cv splits
+        model.fit(X.iloc[tr,:], y.iloc[tr]) # select corresponding rows based on cv index
+        cv_models.append(deepcopy(model))
+        y_pred = model.predict_proba(X.iloc[ts,:])[:,1] # predict using cv split test
+        ytest = y.iloc[ts] # true label
+        patID_ytest = ids.iloc[ts]
+        #patID_ytest = y.iloc[ts]["Patient Identifier"]
+
+        # Precision
+        ypreds.extend(y_pred)
+        yreals.extend(ytest)
+        ypreds_cv.append(y_pred)
+        yreals_cv.append(ytest)
+        roc_auc = roc_auc_score(ytest, y_pred) # metric
+        aucs.append(roc_auc)
+
+        # AUC
+        fpr, tpr, thresholds = roc_curve(ytest, y_pred)
+        tprs.append(interp1d(fpr, tpr, kind='linear')(mean_fpr))
+        tprs[-1][0] = 0.0
+
+        ## Write-up the predictions
+        for eachtestpat,eachpred in enumerate(y_pred):
+            fout.write('{},{},{}\n'.format(patID_ytest.values[eachtestpat],feats,eachpred))
+    fout.close()
+
+    # Mean curve
+    mean_tpr = np.mean(tprs, axis=0)
+    mean_tpr[-1] = 1.0
+    mean_auc = np.mean(aucs)
+    median_auc = np.median(aucs)
+    std_auc = np.std(aucs)
+
+    # Error bands
+    std_tpr = np.std(tprs, axis=0)
+    tprs_upper = np.minimum(mean_tpr + std_tpr, 1)
+    tprs_lower = np.maximum(mean_tpr - std_tpr, 0)
+
+    f = open('/Users/jleng/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/logs/'+'output_'+feats+'.txt', 'a')
+    f.write('{},cv,{},{},{}\n'.format(feats,mean_auc,median_auc,std_auc))
+    print('{},cv,{}\n'.format(feats,mean_auc))
+    f.close()
+
+    ### Refit
+    model.fit(X,y)
+    return [model, cv_models]
+
+```
+
+```{python}
+# run all model optimizers, give best hyperparameters
+def run_all_models(X,y,splits,cut):
+    logres_result_auc = optimise_logres_featsel(X,y,cut=cut,cv=splits,metric='roc_auc')
+    svc_result = optimise_SVC_featsel(X,y,cut=cut,cv=splits)
+    rf_result = optimise_rf_featsel(X,y,cut=cut,cv=splits)
+    averaged_models = AveragingModels(models = (logres_result_auc,svc_result,rf_result))
+    results = {}
+    results['lr'] = logres_result_auc
+    results['svc'] = svc_result
+    results['rf'] = rf_result
+    results['avg'] = averaged_models
+    return results
+
+# refit model by optimal parameters
+def refit_all_models(X,y,results,splits,patID=None):
+    refit = {}
+    for model in results.keys():
+        try:
+            refit[model] = plot_and_refit(X,y,results[model].best_estimator_,splits,ids=patID)
+        except:
+            refit[model] = plot_and_refit(X,y,results[model],splits,ids=patID)
+    return refit
+```
+
+```{python}
+# run model
+y_train = r.metaTrainingPy['pCR'] 
+X_train = r.featuresTrainingPy
+patIDs = r.metaTrainingPy['Patient Identifier']
+X_test = r.featuresTestingPy
+y_test = r.metaTestingPy['pCR']
+
+# generate cv splits
+splits = defineSplits(X_train, y_train, random_state=42) # sample index
+
+# function calling
+results = run_all_models(X_train, y_train, splits, cut=0.9)
+refit_models = refit_all_models(X_train, y_train, results, splits, patID=patIDs)
+final_model = refit_models['avg'][0]
+preds_test = final_model.predict_proba(X_test)[:,1]
+
+# evaluation
+print("AUC:", roc_auc_score(y_test, preds_test)) # 0.58
+print(classification_report(y_test, preds_test > 0.5))
+```
+
+```{python}
+# check parameters
+final_model.models
+
+logistReg = final_model.models[0]
+logistReg_pipeline = logistReg.best_estimator_
+logistReg_pipeline.named_steps['kbest']
+
+final_model.models[1].best_params_
+svc_pipeline = final_model.models[1].best_estimator_
+svc_pipeline.named_steps
+
+final_model.models[2].best_params_
+rf_pipeline = final_model.models[2].best_estimator_
+rf_pipeline.named_steps
+```
+
+```{r}
+# save prediction
+saveRDS(py$preds_test, "~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/benchmarkPrediction.rds")
+```
+
+# 4. Signature identification
+## 4.1 Neratinib arm
+
+```{r}
+# loading saved data
+rna.expression <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/ISPY2/RNA/expression/mRNA_array_hugo.RData")
+metadata <- as.data.frame(read_excel("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/ISPY2/metadata/Supp Table 2.xlsx", skip = 1))
+metadata$`Patient Identifier` <- paste0("X",metadata$`Patient Identifier`)
+rownames(metadata) <- metadata$`Patient Identifier`
+
+ReactomePath <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/pathway lists/Reactome-3.7.Rds")
+logregFit.logitboost <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/InProgress/MajorityVotingModel_LogitBoost")
+logregFit.nb <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/InProgress/MajorityVotingModel_NaiveBayes")
+```
+
+### Pre-processing
+
+```{r}
+# select Neratinib (N) arm
+meta.neratinib <- metadata[metadata$Arm == "Paclitaxel + Neratinib",]
+
+# subset data
+rna.expression.nera <- rna.expression[ ,colnames(rna.expression) %in% rownames(meta.neratinib)]
+meta.neratinib <- meta.neratinib[rownames(meta.neratinib) %in% colnames(rna.expression),]
+meta.neratinib <- meta.neratinib[match(colnames(rna.expression.nera),rownames(meta.neratinib)),]
+stopifnot(sum(colnames(rna.expression.nera)!=rownames(meta.neratinib))==0)
+dim(rna.expression.nera) # 114 patients
+
+# retrieve pCR/RD info
+meta.neratinib.pcr <- ifelse(meta.neratinib$pCR == 0, "RD","pCR")
+
+table(meta.neratinib$`Receptor Subtype`) # 32 TNBC, 23 HR-, 17 HR+, 42 HER2+
+table(meta.neratinib.pcr) # 41 pCR, 73 RD
+
+# filter out HER2+ samples
+meta.neratinib <- meta.neratinib[meta.neratinib$`Receptor Subtype`== "HR+HER2-" | meta.neratinib$`Receptor Subtype`== "TN", ] # 49 samples (32TN, 17HR+HER2-)
+rna.expression.nera <- rna.expression[ ,colnames(rna.expression) %in% rownames(meta.neratinib)]
+dim(rna.expression.nera)
+
+meta.neratinib.pcr <- ifelse(meta.neratinib$pCR == 0, "RD","pCR")
+```
+
+```{python}
+# recall neural network structure
+class contrastive_neural(nn.Module):
+    def __init__(self, Dinput, Dembedding, p_drop):
+        super().__init__()
+        self.fc1 = nn.Linear(Dinput, 64, bias = True)
+        self.act1 = nn.ReLU()
+        self.norm1 = nn.LayerNorm(64)
+        
+        self.dropout = nn.Dropout(p=p_drop)
+        
+        self.fc2 = nn.Linear(64, 128)
+        self.act2 = nn.ReLU()
+        self.norm2 = nn.LayerNorm(128)
+        
+        self.fc3 = nn.Linear(128, Dembedding)
+        
+    def forward(self, x):
+        x = self.norm1(self.act1(self.fc1(x)))
+        x = self.norm2(self.act2(self.fc2(x)))
+        x = self.dropout(x)
+        x = F.normalize(x, dim=1)
+        x = self.fc3(x)
+        x = F.normalize(x, dim=1)
+        return x
+      
+class DownstreamClassifier(pl.LightningModule):
+    def __init__(self, encoder, embedding_dim, num_classes, lr=1e-3, weight_decay=1e-5, max_epochs=200):
+        super().__init__()
+        self.save_hyperparameters(ignore=['encoder']) # save hyperparameters for auto-log
+        self.encoder = encoder  # pre-trained embedder model
+        self.classifier = nn.Linear(embedding_dim, num_classes) # add classification layer
+    def forward(self, x):
+        with torch.no_grad():
+             embeddings = self.encoder(x)
+        logits = self.classifier(embeddings)
+        return logits
+    
+    def configure_optimizers(self):
+        optimizer = optim.Adam(self.parameters(),
+                                lr=self.hparams.lr, # pull values from saved parameters
+                                weight_decay=self.hparams.weight_decay)
+        scheduler = optim.lr_scheduler.MultiStepLR(optimizer,
+                                                   milestones=[int(self.hparams.max_epochs*0.6),
+                                                               int(self.hparams.max_epochs*0.8)],
+                                                   gamma=0.1)
+        return [optimizer], [scheduler]
+
+    def _shared_step(self, batch, mode='train'):
+        x = batch['anchor']    
+        y = batch['sample_label'] # true label
+
+        with torch.no_grad():
+            embeddings = self.encoder(x) # call embedder model
+        logits = self.classifier(embeddings) # call classifier model
+        loss = F.cross_entropy(logits, y) # calculate loss
+        self.log(f'{mode}_loss', loss, prog_bar=True) # print values
+        return loss
+
+    def training_step(self, batch, batch_idx):
+        return self._shared_step(batch, mode='train')
+```
+
+### Extract features
+
+```{r}
+# extract reactome pathways
+root <- c('R-HSA-1640170', # cell cycle
+          'R-HSA-168256', # immune system
+          'R-HSA-1474244', # extracellular matrix ornerazation
+          'R-HSA-1500931') # cell-cell communication
+graph <- graph_from_data_frame(ReactomePath$relationships,directed = T)
+path  <- ego(graph, order=length(V(graph)), nodes=root, mode="out") # extract all downstream pathways
+toInclude <- names(unlist(path)) # 364 pathways to include
+graph <- make_ego_graph(graph, order=length(V(graph)), nodes=root, mode="out")
+
+# extract pathways
+ReactomePath$genesets <- ReactomePath$genesets[(ReactomePath$geneset.descriptions %in% toInclude)]
+ReactomePath$geneset.names <- ReactomePath$geneset.names[(ReactomePath$geneset.descriptions %in% toInclude)]
+ReactomePath$geneset.descriptions <- ReactomePath$geneset.descriptions[(ReactomePath$geneset.descriptions %in% toInclude)]
+names(ReactomePath$genesets) <- ReactomePath$geneset.names
+reactome.pathways <- ReactomePath$genesets # 364 pathways
+
+# filter out pathways which contain < 15 genes
+toExclude.short <- names(reactome.pathways)[sapply(reactome.pathways, length) < 15]
+reactome.pathways <- reactome.pathways[!(names(reactome.pathways) %in% toExclude.short)]
+
+reactome.pathways <- reactome.pathways[names(reactome.pathways) %in% colnames(features.training)]
+length(reactome.pathways) # 17 selected features
+```
+
+```{r}
+# singscore function calling
+reactome.scores.nera <- calculateSingScore(expressionMatrix = rna.expression.nera,
+                                          allPathways = reactome.pathways)
+dim(reactome.scores.nera)
+```
+
+```{r}
+# define function for getting receptor status
+getExpressionVal <- function(expressionMatrix, geneNames) {
+  receptorStatus.df <- as.data.frame(matrix(ncol = length(geneNames), 
+                                            nrow = ncol(expressionMatrix)))
+  rownames(receptorStatus.df) <- colnames(expressionMatrix)
+  colnames(receptorStatus.df) <- geneNames
+
+  for(i in 1:length(geneNames)) {
+    colnames(receptorStatus.df)[i] <- paste0(colnames(receptorStatus.df)[i],"expression")
+    receptorStatus.df[,i] <- as.numeric(expressionMatrix[geneNames[i], ]) # retrieve values
+    receptorStatus.df[,i] <- as.numeric(scale(receptorStatus.df[,i])) # normalization
+  }
+  return(receptorStatus.df)
+}
+
+# function calling
+receptorStatus.nera <- getExpressionVal(expressionMatrix = rna.expression.nera,
+                                        geneNames = c("ERBB2","ESR1","PGR"))
+dim(receptorStatus.nera)
+```
+
+```{r}
+# combine features
+features.neratinib <- cbind(reactome.scores.nera, receptorStatus.nera)
+
+# normalization
+scale.backup <- scale(features.neratinib[,18])
+for(i in 1:20) {
+  features.neratinib[,i] <- as.numeric(scale(features.neratinib[,i]))
+}
+stopifnot(as.numeric(scale.backup) == as.numeric(features.neratinib[,18]))
+boxplot(features.neratinib) # sanity check
+
+# convert to python format
+featuresNeratinibPy = r_to_py(features.neratinib) # features
+metaNeratinibPy = r_to_py(meta.neratinib) # metadata
+```
+
+### Model application
+
+```{r}
+# predict
+logregLogitBoost.predict <- predict(logregFit.logitboost, features.neratinib, type = "prob")
+logregNB.predict <- predict(logregFit.nb, features.neratinib, type = "prob")
+
+# check performance
+par(pty = "s")
+roc(factor(meta.neratinib.pcr), logregNB.predict[,"pCR"],levels = c("RD","pCR"), direction = "<",
+    plot = T, asp = NA, col = "royalblue", lwd = 2, legacy.axes = T, print.auc = T,
+    main = "ROC curve for NB model in ISPY2 Neratinib arm") # 0.596
+confusionMatrix(factor(ifelse(logregNB.predict[,"pCR"] > 0.5, "pCR","RD")), factor(meta.neratinib.pcr)) # 0.26, 0.76
+```
+
+```{python}
+ContrastiveModel = contrastive_neural(Dinput=20, Dembedding=16, p_drop = 0.2)
+classifier = DownstreamClassifier(encoder=ContrastiveModel, embedding_dim=16, num_classes=2)
+classifier.load_state_dict(torch.load("/Users/jleng/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/InProgress/ContrastiveLearningTrainedClassifier_extraLayer_ISPY2CtrTrain_frozen"))
+classifier.eval()
+
+# prediction
+testing_tensor = torch.tensor(r.featuresNeratinibPy.values, dtype=torch.float32) # [114,20]
+
+with torch.no_grad():
+    logitsTesting = classifier(testing_tensor)
+    probsTesting = F.softmax(logitsTesting, dim=1)
+    probsTesting = probsTesting.numpy()
+
+pcr_probsTesting = probsTesting[:,1]
+```
+
+```{r}
+cl_vec <- py$pcr_probsTesting
+plot(density(cl_vec))
+cl_class <- ifelse(cl_vec>0.5, "pCR","RD")
+```
+
+```{r}
+# mean probability (for calculating AUC)
+averagedPrediction <- matrix(nrow = nrow(features.neratinib), ncol = 1)
+rownames(averagedPrediction) <- rownames(features.neratinib)
+colnames(averagedPrediction) <- "pCR"
+for(i in 1:nrow(averagedPrediction)) {
+  averagedPrediction[i,1] <- mean(c(logregLogitBoost.predict[i,1],
+                                    logregNB.predict[i,1],
+                                    cl_vec
+                                    ))
+}
+averagedPrediction[1:5,]
+
+# majority voting (> 2 pCR = pCR)
+finalPrediction_voted <- as.data.frame(matrix(nrow = nrow(meta.neratinib), ncol = 4
+                                              ))
+rownames(finalPrediction_voted) <- rownames(features.neratinib)
+colnames(finalPrediction_voted) <- c("LogitBoost","NB","CL","Final")
+
+finalPrediction_voted$LogitBoost <- ifelse(logregLogitBoost.predict[,"pCR"] > 0.5, "pCR", "RD")
+finalPrediction_voted$NB <- ifelse(logregNB.predict[,"pCR"] > 0.5, "pCR", "RD")
+finalPrediction_voted$CL <- cl_class
+
+for(i in 1:length(meta.neratinib.pcr)) {
+  ifelse(sum(finalPrediction_voted[i,1:3] == "pCR") >= 2, 
+         finalPrediction_voted$Final[i] <- "pCR", finalPrediction_voted$Final[i] <- "RD")
+}
+finalPrediction_voted[1:5,]
+
+# performance
+par(pty = "s")
+roc(factor(meta.neratinib.pcr), averagedPrediction[,"pCR"],levels = c("RD","pCR"), direction = "<",
+    plot = T, asp = NA, col = "royalblue", lwd = 2, legacy.axes = T, print.auc = T,
+    main = "ROC curve for Majority Voting model in Neratinib arm") # 0.76
+confusionMatrix(factor(finalPrediction_voted$Final), factor(meta.neratinib.pcr)) # 0.7, 0.9
+```
+
+### Interpretation
+
+```{r}
+# identify mis-classified cases
+finalPrediction_voted$Reference <- as.character(meta.neratinib.pcr) # true labels
+
+falsePositiveSamples <- rownames(finalPrediction_voted[finalPrediction_voted$Final == "pCR" & finalPrediction_voted$Reference == "RD", ]) # 6
+falseNegativeSamples <- rownames(finalPrediction_voted[finalPrediction_voted$Final == "RD" & finalPrediction_voted$Reference == "pCR", ]) # 14
+truePositiveSamples <- rownames(finalPrediction_voted[finalPrediction_voted$Final == "pCR" & finalPrediction_voted$Reference == "pCR", ]) # 1
+trueNegativeSamples <- rownames(finalPrediction_voted[finalPrediction_voted$Final == "RD" & finalPrediction_voted$Reference == "RD", ]) # 28
+
+# obtain corresponding expression profiles
+rna.nera.falsePos <- rna.expression.nera[,colnames(rna.expression.nera) %in% falsePositiveSamples]
+rna.nera.falseNeg <- rna.expression.nera[,colnames(rna.expression.nera) %in% falseNegativeSamples]
+dim(rna.nera.falseNeg)
+rna.nera.truePos <- rna.expression.nera[,colnames(rna.expression.nera) %in% truePositiveSamples]
+rna.nera.trueNeg <- rna.expression.nera[,colnames(rna.expression.nera) %in% trueNegativeSamples]
+```
+
+```{r}
+# DGE
+# combine trueNeg & falseNeg for comparing
+comparingCases <- cbind(rna.nera.falseNeg, rna.nera.truePos)
+truePrediction <- rep(0, ncol(rna.nera.falseNeg)) # if predicted pCR == true pCR
+truePrediction <- c(truePrediction, 1)
+names(truePrediction) <- colnames(comparingCases)
+
+truePrediction
+```
+
+```{r}
+# design matrix
+response <- factor(truePrediction, levels=c(0,1), labels=c("falseNeg","truePos"))
+design <- model.matrix(~0 + response)
+rownames(design) <-colnames(comparingCases)
+contrast.matrix <- makeContrasts(responsetruePos-responsefalseNeg, levels = design)
+
+# fit linear model
+fit <- lmFit(comparingCases, design = design)
+fit <- contrasts.fit(fit, contrasts = contrast.matrix)
+efit <- eBayes(fit, trend = TRUE,robust = TRUE)
+degs_ebayes <- topTable(efit, adjust.method="BH", sort.by = "p", n=Inf, p.value = 1)
+
+# label significant genes
+treat_table <- degs_ebayes %>% 
+  mutate(expression = case_when(logFC >= 0 & adj.P.Val < 0.15 ~ "Up-regulated",
+                                logFC <= 0 & adj.P.Val < 0.15 ~ "Down-regulated",
+                                adj.P.Val>= 0.15 ~ "Not-DE"))
+print(degs_ebayes[1:10, ])
+print(treat_table[1:10, ])
+
+treat_table <- treat_table[order(treat_table$logFC), ]
+treat.ranked <- treat_table$logFC
+names(treat.ranked) <- rownames(treat_table)
+```
+
+```{r}
+ReactomePath <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/pathway lists/Reactome-3.7.Rds")
+
+# list pathways to exclude
+root <- c('R-HSA-162582' # signal transduction
+          )
+graph <- graph_from_data_frame(ReactomePath$relationships,directed = T)
+path  <- ego(graph, order=length(V(graph)), nodes=root, mode="out") # extract all downstream pathways
+toExclude <- names(unlist(path)) # 220 pathways to exclude
+graph <- make_ego_graph(graph, order=length(V(graph)), nodes=root, mode="out")
+
+# extract pathways
+ReactomePath$genesets <- ReactomePath$genesets[(ReactomePath$geneset.descriptions %in% toExclude)]
+ReactomePath$geneset.names <- ReactomePath$geneset.names[(ReactomePath$geneset.descriptions %in% toExclude)]
+ReactomePath$geneset.descriptions <- ReactomePath$geneset.descriptions[(ReactomePath$geneset.descriptions %in% toExclude)]
+names(ReactomePath$genesets) <- ReactomePath$geneset.names
+reactome.pathways <- ReactomePath$genesets # 447 pathways
+
+# filter out pathways which contain < 3 genes
+toExclude.short <- names(reactome.pathways)[sapply(reactome.pathways, length) < 3] # 10
+reactome.pathways <- reactome.pathways[!(names(reactome.pathways) %in% toExclude.short)]
+length(reactome.pathways) # 403 pathways (contain > 3 genes)
+```
+
+```{r}
+# singscore function calling
+reactome.scores.truePos <- calculateSingScore(expressionMatrix = as.data.frame(rna.nera.truePos),
+                                          allPathways = reactome.pathways)
+reactome.scores.falseNeg <- calculateSingScore(expressionMatrix = rna.nera.falseNeg,
+                                          allPathways = reactome.pathways)
+reactome.scores.trueNeg <- calculateSingScore(expressionMatrix = as.data.frame(rna.nera.trueNeg),
+                                          allPathways = reactome.pathways)
+reactome.scores.falsePos <- calculateSingScore(expressionMatrix = rna.nera.falsePos,
+                                          allPathways = reactome.pathways)
+```
+
+```{r}
+# wilcoxon test for all pathways
+wilcox.nera <- sapply(1: length(reactome.pathways), function(i) {
+  wilcox.test(reactome.scores.truePos[,i], reactome.scores.falseNeg[,i], paired = F)$p.value
+  })
+table(wilcox.nera < 0.15) # 50
+
+colnames(reactome.scores.falseNeg[,c(wilcox.nera < 0.15)]) # only 1 TP sample, no need to adjust
+```
+
+### Save signatures
+
+```{r}
+saveRDS(averagedPrediction[,"pCR"],"~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/predictions_neratumab.rds")
+saveRDS(neratumabMarkers,"~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/biomarkers_neratumab.rds")
+```
+
+### Validation
+
+```{r}
+rna.nera.pcr <- rna.expression.nera[, colnames(rna.expression.nera) %in% rownames(meta.neratinib[meta.neratinib$pCR == 1, ])]
+rna.nera.rd <- rna.expression.nera[, !colnames(rna.expression.nera) %in% colnames(rna.nera.pcr)]
+dim(rna.nera.pcr)
+dim(rna.nera.rd)
+
+sigValidation.pcr <- calculateSingScore(expressionMatrix = rna.nera.pcr,
+                                        allPathways = reactome.pathways)
+sigValidation.rd <- calculateSingScore(expressionMatrix = rna.nera.rd,
+                                       allPathways = reactome.pathways)
+sigValidation.pcr <- sigValidation.pcr$`EGFR downregulation`
+sigValidation.rd <- sigValidation.rd$`EGFR downregulation`
+
+sigValidation.long <- data.frame(Class = factor(c(rep("pCR", length(sigValidation.pcr)),
+                                                  rep("RD", length(sigValidation.rd)))),
+                                 Value = c(sigValidation.pcr, sigValidation.rd))
+```
+
+```{r}
+ggplot(sigValidation.long, aes(x = Class, y = Value, fill = Class)) +
+  geom_boxplot(width = 0.8) +
+  scale_fill_manual(values = c("#8abcd1","#a59aca")) +
+  stat_compare_means(
+    method = "t.test",
+    method.args = list(var.equal = TRUE),
+    label = "p.format",
+    size = 5.5,
+    label.x = 1.3
+  ) +
+  theme_classic() +
+  labs(title = "Neratinib: EGFR downregulation", 
+       x = NULL, y = "Expression")+
+  theme(
+  aspect.ratio = 1,
+  axis.text = element_text(size = 20, colour = "black"),
+  axis.title = element_text(size = 20),
+  legend.position = "none",
+  # legend.text = element_text(size = 15),
+  # legend.title = element_text(size = 15),
+  plot.title = element_text(size = 20, hjust = 0.5),
+  plot.margin = margin(10, 10, 10, 10)
+  )
+```
+
+## 4.2 AMG386 arm
+### Pre-processing
+
+```{r}
+# select AMG386 arm
+meta.amg <- metadata[metadata$Arm == "Paclitaxel + AMG 386",]
+
+# subset data
+rna.expression.amg <- rna.expression[ ,colnames(rna.expression) %in% rownames(meta.amg)]
+meta.amg <- meta.amg[rownames(meta.amg) %in% colnames(rna.expression),]
+meta.amg <- meta.amg[match(colnames(rna.expression.amg),rownames(meta.amg)),]
+stopifnot(sum(colnames(rna.expression.amg)!=rownames(meta.amg))==0)
+dim(rna.expression.amg) # 115 patients
+
+# retrieve pCR/RD info
+meta.amg.pcr <- ifelse(meta.amg$pCR == 0, "RD","pCR")
+
+table(meta.amg$`Receptor Subtype`) # 53 TNBC, 62 HR+
+table(meta.amg.pcr) # 33 pCR, 82 RD
+```
+
+### Extract features
+
+```{r}
+# extract reactome pathways
+root <- c('R-HSA-1640170', # cell cycle
+          'R-HSA-168256', # immune system
+          'R-HSA-1474244', # extracellular matrix organization
+          'R-HSA-1500931') # cell-cell communication
+graph <- graph_from_data_frame(ReactomePath$relationships,directed = T)
+path  <- ego(graph, order=length(V(graph)), nodes=root, mode="out") # extract all downstream pathways
+toInclude <- names(unlist(path)) # 364 pathways to include
+graph <- make_ego_graph(graph, order=length(V(graph)), nodes=root, mode="out")
+
+# extract pathways
+ReactomePath$genesets <- ReactomePath$genesets[(ReactomePath$geneset.descriptions %in% toInclude)]
+ReactomePath$geneset.names <- ReactomePath$geneset.names[(ReactomePath$geneset.descriptions %in% toInclude)]
+ReactomePath$geneset.descriptions <- ReactomePath$geneset.descriptions[(ReactomePath$geneset.descriptions %in% toInclude)]
+names(ReactomePath$genesets) <- ReactomePath$geneset.names
+reactome.pathways <- ReactomePath$genesets # 364 pathways
+
+# filter out pathways which contain < 15 genes
+toExclude.short <- names(reactome.pathways)[sapply(reactome.pathways, length) < 15]
+reactome.pathways <- reactome.pathways[!(names(reactome.pathways) %in% toExclude.short)]
+
+reactome.pathways <- reactome.pathways[names(reactome.pathways) %in% colnames(features.training)]
+length(reactome.pathways) # 17 selected features
+```
+
+```{r}
+# singscore function calling
+reactome.scores.amg <- calculateSingScore(expressionMatrix = rna.expression.amg,
+                                          allPathways = reactome.pathways)
+dim(reactome.scores.amg)
+
+# expression status function calling
+receptorStatus.amg <- getExpressionVal(expressionMatrix = rna.expression.amg,
+                                        geneNames = c("ERBB2","ESR1","PGR"))
+dim(receptorStatus.amg)
+```
+
+```{r}
+# combine features
+features.amg <- cbind(reactome.scores.amg, receptorStatus.amg)
+
+scale.backup <- scale(features.amg[,18])
+for(i in 1:20) {
+  features.amg[,i] <- as.numeric(scale(features.amg[,i]))
+}
+stopifnot(as.numeric(scale.backup) == as.numeric(features.amg[,18]))
+boxplot(features.amg)
+
+# convert to python format
+featuresNeratinibPy = r_to_py(features.amg) # features
+metaNeratinibPy = r_to_py(meta.amg) # metadata
+```
+
+### Model application
+
+```{r}
+# predict
+logregLogitBoost.predict <- predict(logregFit.logitboost, features.amg, type = "prob")
+logregNB.predict <- predict(logregFit.nb, features.amg, type = "prob")
+```
+
+
+```{python}
+# load NN model weights
+ContrastiveModel = contrastive_neural(Dinput=20, Dembedding=16, p_drop = 0.2)
+classifier = DownstreamClassifier(encoder=ContrastiveModel, embedding_dim=16, num_classes=2)
+classifier.load_state_dict(torch.load("/Users/jleng/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/InProgress/ContrastiveLearningTrainedClassifier_extraLayer_ISPY2CtrTrain_frozen"))
+classifier.eval()
+```
+
+```{python}
+# prediction
+testing_tensor = torch.tensor(r.featuresAMGPy.values, dtype=torch.float32) # [114,20]
+
+with torch.no_grad():
+    logitsTesting = classifier(testing_tensor)
+    probsTesting = F.softmax(logitsTesting, dim=1)
+    probsTesting = probsTesting.numpy()
+
+pcr_probsTesting = probsTesting[:,1]
+```
+
+```{r}
+cl_vec <- py$pcr_probsTesting
+plot(density(cl_vec))
+cl_class <- ifelse(cl_vec>0.5, "pCR","RD")
+```
+
+```{r}
+# mean probability (for calculating AUC)
+averagedPrediction <- matrix(nrow = nrow(features.amg), ncol = 1)
+rownames(averagedPrediction) <- rownames(features.amg)
+colnames(averagedPrediction) <- "pCR"
+for(i in 1:nrow(averagedPrediction)) {
+  averagedPrediction[i,1] <- mean(c(logregLogitBoost.predict[i,1],
+                                    logregNB.predict[i,1],
+                                    cl_vec
+                                    ))
+}
+averagedPrediction[1:5,]
+
+# majority voting (> 2 pCR = pCR)
+finalPrediction_voted <- as.data.frame(matrix(nrow = nrow(meta.amg), ncol = 4
+                                              ))
+rownames(finalPrediction_voted) <- rownames(features.amg)
+colnames(finalPrediction_voted) <- c("LogitBoost","NB","CL","Final")
+
+finalPrediction_voted$LogitBoost <- ifelse(logregLogitBoost.predict[,"pCR"] > 0.5, "pCR", "RD")
+finalPrediction_voted$NB <- ifelse(logregNB.predict[,"pCR"] > 0.5, "pCR", "RD")
+finalPrediction_voted$CL <- cl_class
+
+for(i in 1:length(meta.amg.pcr)) {
+  ifelse(sum(finalPrediction_voted[i,1:3] == "pCR") >= 2, 
+         finalPrediction_voted$Final[i] <- "pCR", finalPrediction_voted$Final[i] <- "RD")
+}
+finalPrediction_voted[1:5,]
+
+# performance
+par(pty = "s")
+roc(factor(meta.amg.pcr), averagedPrediction[,"pCR"],levels = c("RD","pCR"), direction = "<",
+    plot = T, asp = NA, col = "royalblue", lwd = 2, legacy.axes = T, print.auc = T,
+    main = "ROC curve for Majority Voting model in ISPY2 AMG386 arm") # 0.68
+confusionMatrix(factor(finalPrediction_voted$Final), factor(meta.amg.pcr)) # 0.27, 0.86
+```
+
+### Interpretation
+
+```{r}
+# identify mis-classified cases
+finalPrediction_voted$Reference <- as.character(meta.amg.pcr) # true labels
+
+falsePositiveSamples <- rownames(finalPrediction_voted[finalPrediction_voted$Final == "pCR" & finalPrediction_voted$Reference == "RD", ]) # 4
+falseNegativeSamples <- rownames(finalPrediction_voted[finalPrediction_voted$Final == "RD" & finalPrediction_voted$Reference == "pCR", ]) # 29
+truePositiveSamples <- rownames(finalPrediction_voted[finalPrediction_voted$Final == "pCR" & finalPrediction_voted$Reference == "pCR", ]) # 4
+trueNegativeSamples <- rownames(finalPrediction_voted[finalPrediction_voted$Final == "RD" & finalPrediction_voted$Reference == "RD", ]) # 78
+
+# obtain corresponding expression profiles
+rna.amg.falsePos <- rna.expression.amg[,colnames(rna.expression.amg) %in% falsePositiveSamples]
+rna.amg.falseNeg <- rna.expression.amg[,colnames(rna.expression.amg) %in% falseNegativeSamples]
+dim(rna.amg.falseNeg)
+rna.amg.truePos <- rna.expression.amg[,colnames(rna.expression.amg) %in% truePositiveSamples]
+rna.amg.trueNeg <- rna.expression.amg[,colnames(rna.expression.amg) %in% trueNegativeSamples]
+dim(rna.amg.trueNeg)
+```
+
+```{r}
+# show prediction confidence probabilities
+finalPrediction_voted$LogitBoost.prob <- logregLogitBoost.predict[,"pCR"]
+finalPrediction_voted$NB.prob <- logregNB.predict[,"pCR"]
+finalPrediction_voted$CL.prob <- cl_vec
+falseNegativeSamples <- finalPrediction_voted[finalPrediction_voted$Final == "RD" & finalPrediction_voted$Reference == "pCR", ] # 29
+
+# filter: samples with 3RD prediction
+FN_confidentProb <- falseNegativeSamples[falseNegativeSamples$LogitBoost == "RD" & falseNegativeSamples$NB == "RD" & falseNegativeSamples$CL == "RD", ] # 12 very wrong cases
+
+rna.amg.falseNeg <- rna.expression.amg[,colnames(rna.expression.amg) %in% rownames(FN_confidentProb)]
+dim(rna.amg.falseNeg)
+dim(rna.amg.truePos)
+```
+
+```{r}
+# DGE
+# combine trueNeg & falseNeg for comparing
+comparingCases <- cbind(rna.amg.falseNeg, rna.amg.truePos)
+truePrediction <- rep(0, ncol(rna.amg.falseNeg)) # if predicted pCR == true pCR
+truePrediction <- c(truePrediction, rep(1, ncol(rna.amg.truePos)))
+names(truePrediction) <- colnames(comparingCases)
+truePrediction
+```
+
+```{r}
+# design matrix
+response <- factor(truePrediction, levels=c(0,1), labels=c("falseNeg","truePos"))
+design <- model.matrix(~0 + response)
+rownames(design) <-colnames(comparingCases)
+contrast.matrix <- makeContrasts(responsetruePos-responsefalseNeg, levels = design)
+
+# fit linear model
+fit <- lmFit(comparingCases, design = design)
+fit <- contrasts.fit(fit, contrasts = contrast.matrix)
+efit <- eBayes(fit, trend = TRUE,robust = TRUE)
+degs_ebayes <- topTable(efit, adjust.method="BH", sort.by = "p", n=Inf, p.value = 1)
+
+# label significant genes
+treat_table <- degs_ebayes %>% 
+  mutate(expression = case_when(logFC >= 0 & adj.P.Val < 0.15 ~ "Up-regulated",
+                                logFC <= 0 & adj.P.Val < 0.15 ~ "Down-regulated",
+                                adj.P.Val>= 0.05 ~ "Not-DE"))
+
+print(degs_ebayes[1:10, ])
+print(treat_table[1:10, ])
+
+treat_table <- treat_table[order(treat_table$logFC), ]
+treat.ranked <- treat_table$logFC
+names(treat.ranked) <- rownames(treat_table)
+```
+
+```{r}
+ReactomePath <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/pathway lists/Reactome-3.7.Rds")
+
+# list pathways to exclude
+root <- c('R-HSA-162582' # signal transduction
+          )
+graph <- graph_from_data_frame(ReactomePath$relationships,directed = T)
+path  <- ego(graph, order=length(V(graph)), nodes=root, mode="out") # extract all downstream pathways
+toExclude <- names(unlist(path)) # 220 pathways to exclude
+graph <- make_ego_graph(graph, order=length(V(graph)), nodes=root, mode="out")
+
+# extract pathways
+ReactomePath$genesets <- ReactomePath$genesets[(ReactomePath$geneset.descriptions %in% toExclude)]
+ReactomePath$geneset.names <- ReactomePath$geneset.names[(ReactomePath$geneset.descriptions %in% toExclude)]
+ReactomePath$geneset.descriptions <- ReactomePath$geneset.descriptions[(ReactomePath$geneset.descriptions %in% toExclude)]
+names(ReactomePath$genesets) <- ReactomePath$geneset.names
+reactome.pathways <- ReactomePath$genesets # 447 pathways
+
+# filter out pathways which contain < 3 genes
+toExclude.short <- names(reactome.pathways)[sapply(reactome.pathways, length) < 3] # 10
+reactome.pathways <- reactome.pathways[!(names(reactome.pathways) %in% toExclude.short)]
+length(reactome.pathways) # 403 pathways (contain > 3 genes)
+
+# singscore function calling
+reactome.scores.truePos <- calculateSingScore(expressionMatrix = rna.amg.truePos,
+                                          allPathways = reactome.pathways)
+reactome.scores.falseNeg <- calculateSingScore(expressionMatrix = rna.amg.falseNeg,
+                                          allPathways = reactome.pathways)
+```
+
+```{r}
+# wilcoxon test for all pathways
+wilcox.amg <- sapply(1: length(reactome.pathways), function(i) {
+  wilcox.test(reactome.scores.truePos[,i], reactome.scores.falseNeg[,i], paired = F)$p.value
+  })
+
+# P value adjustment
+wilcox.amg.adjusted <- p.adjust(wilcox.amg, method="BH")
+table(wilcox.amg.adjusted < 0.15) # 3
+
+AMGmarkers <- colnames(reactome.scores.falseNeg[,c(wilcox.amg.adjusted < 0.15)])
+AMGmarkers
+```
+
+### Save signatures
+
+```{r}
+saveRDS(averagedPrediction[,"pCR"],"~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/predictions_AMG386.rds")
+saveRDS(AMGmarkers,"~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/biomarkers_AMG386.rds")
+```
+
+### Validation
+
+```{r}
+rna.amg.pcr <- rna.expression.amg[, colnames(rna.expression.amg) %in% rownames(meta.amg[meta.amg$pCR == 1, ])]
+rna.amg.rd <- rna.expression.amg[, !colnames(rna.expression.amg) %in% colnames(rna.amg.pcr)]
+dim(rna.amg.pcr)
+dim(rna.amg.rd)
+
+sigValidation.pcr <- calculateSingScore(expressionMatrix = rna.amg.pcr,
+                                        allPathways = reactome.pathways)
+sigValidation.rd <- calculateSingScore(expressionMatrix = rna.amg.rd,
+                                       allPathways = reactome.pathways)
+sigValidation.pcr <- sigValidation.pcr$`Signaling by Erythropoietin`
+sigValidation.rd <- sigValidation.rd$`Signaling by Erythropoietin`
+
+sigValidation.long <- data.frame(Class = factor(c(rep("pCR", length(sigValidation.pcr)),
+                                                  rep("RD", length(sigValidation.rd)))),
+                                 Value = c(sigValidation.pcr, sigValidation.rd))
+```
+
+```{r}
+ggplot(sigValidation.long, aes(x = Class, y = Value, fill = Class)) +
+  geom_boxplot(width = 0.8) +
+  scale_fill_manual(values = c("#8abcd1","#a59aca")) +
+  stat_compare_means(
+    method = "t.test",
+    method.args = list(var.equal = TRUE),
+    label = "p.format",
+    size = 5.5,
+    label.x = 1.3
+  ) +
+  theme_classic() +
+  labs(title = "AMG386: Signaling by Erythropoietin", 
+       x = NULL, y = "Expression")+
+  theme(
+  aspect.ratio = 1,
+  axis.text = element_text(size = 20, colour = "black"),
+  axis.title = element_text(size = 20),
+  legend.position = "none",
+  #legend.text = element_text(size = 15),
+  plot.title = element_text(size = 20, hjust = 0.5),
+  plot.margin = margin(10, 10, 10, 10)
+  )
+```
+
+## 4.3 Ganitumab arm
+### Pre-processing
+
+```{r}
+# select Ganitumab arm
+meta.ganitumab <- metadata[metadata$Arm == "Paclitaxel + Ganitumab",]
+
+# subset data
+rna.expression.gani <- rna.expression[ ,colnames(rna.expression) %in% rownames(meta.ganitumab)]
+meta.ganitumab <- meta.ganitumab[rownames(meta.ganitumab) %in% colnames(rna.expression),]
+meta.ganitumab <- meta.ganitumab[match(colnames(rna.expression.gani),rownames(meta.ganitumab)),]
+stopifnot(sum(colnames(rna.expression.gani)!=rownames(meta.ganitumab))==0)
+dim(rna.expression.gani) # 115 patients
+
+# retrieve pCR/RD info
+meta.gani.pcr <- ifelse(meta.ganitumab$pCR == 0, "RD","pCR")
+
+table(meta.ganitumab$`Receptor Subtype`) # 48 TNBC, 58 HR+
+table(meta.gani.pcr) # 24 pCR, 82 RD
+```
+
+### Extract features
+
+```{r}
+ReactomePath <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/pathway lists/Reactome-3.7.Rds")
+
+# extract reactome pathways
+root <- c('R-HSA-1640170', # cell cycle
+          'R-HSA-168256', # immune system
+          'R-HSA-1474244', # extracellular matrix organization
+          'R-HSA-1500931') # cell-cell communication
+graph <- graph_from_data_frame(ReactomePath$relationships,directed = T)
+path  <- ego(graph, order=length(V(graph)), nodes=root, mode="out") # extract all downstream pathways
+toInclude <- names(unlist(path)) # 364 pathways to include
+graph <- make_ego_graph(graph, order=length(V(graph)), nodes=root, mode="out")
+
+# extract pathways
+ReactomePath$genesets <- ReactomePath$genesets[(ReactomePath$geneset.descriptions %in% toInclude)]
+ReactomePath$geneset.names <- ReactomePath$geneset.names[(ReactomePath$geneset.descriptions %in% toInclude)]
+ReactomePath$geneset.descriptions <- ReactomePath$geneset.descriptions[(ReactomePath$geneset.descriptions %in% toInclude)]
+names(ReactomePath$genesets) <- ReactomePath$geneset.names
+reactome.pathways <- ReactomePath$genesets # 364 pathways
+
+# filter out pathways which contain < 15 genes
+toExclude.short <- names(reactome.pathways)[sapply(reactome.pathways, length) < 15]
+reactome.pathways <- reactome.pathways[!(names(reactome.pathways) %in% toExclude.short)]
+
+reactome.pathways <- reactome.pathways[names(reactome.pathways) %in% colnames(features.training)]
+length(reactome.pathways) # 17 selected features
+```
+
+```{r}
+# singscore function calling
+reactome.scores.gani <- calculateSingScore(expressionMatrix = rna.expression.gani,
+                                          allPathways = reactome.pathways)
+dim(reactome.scores.gani)
+
+# receptor status function calling
+receptorStatus.gani <- getExpressionVal(expressionMatrix = rna.expression.gani,
+                                        geneNames = c("ERBB2","ESR1","PGR"))
+dim(receptorStatus.gani)
+```
+
+```{r}
+# combine features
+features.gani <- cbind(reactome.scores.gani, receptorStatus.gani)
+
+scale.backup <- scale(features.gani[,18])
+for(i in 1:20) {
+  features.gani[,i] <- as.numeric(scale(features.gani[,i]))
+}
+stopifnot(as.numeric(scale.backup) == as.numeric(features.gani[,18]))
+boxplot(features.gani)
+
+# convert to python format
+featuresGanitumabPy = r_to_py(features.gani) # features
+metaGanitumabPy = r_to_py(meta.ganitumab) # metadata
+```
+
+### Model application
+
+```{r}
+# predict
+logregLogitBoost.predict <- predict(logregFit.logitboost, features.gani, type = "prob")
+logregNB.predict <- predict(logregFit.nb, features.gani, type = "prob")
+```
+
+```{python}
+ContrastiveModel = contrastive_neural(Dinput=20, Dembedding=16, p_drop = 0.2)
+classifier = DownstreamClassifier(encoder=ContrastiveModel, embedding_dim=16, num_classes=2)
+classifier.load_state_dict(torch.load("/Users/jleng/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/InProgress/ContrastiveLearningTrainedClassifier_extraLayer_ISPY2CtrTrain_frozen"))
+classifier.eval()
+```
+
+```{python}
+# prediction
+testing_tensor = torch.tensor(r.featuresGanitumabPy.values, dtype=torch.float32) # [114,20]
+
+with torch.no_grad():
+    logitsTesting = classifier(testing_tensor)
+    probsTesting = F.softmax(logitsTesting, dim=1)
+    probsTesting = probsTesting.numpy()
+
+pcr_probsTesting = probsTesting[:,1]
+```
+
+```{r}
+cl_vec <- py$pcr_probsTesting
+plot(density(cl_vec))
+cl_class <- ifelse(cl_vec>0.5, "pCR","RD")
+```
+
+```{r}
+# mean probability (for calculating AUC)
+averagedPrediction <- matrix(nrow = nrow(features.gani), ncol = 1)
+rownames(averagedPrediction) <- rownames(features.gani)
+colnames(averagedPrediction) <- "pCR"
+for(i in 1:nrow(averagedPrediction)) {
+  averagedPrediction[i,1] <- mean(c(logregLogitBoost.predict[i,1],
+                                    logregNB.predict[i,1],
+                                    cl_vec
+                                    ))
+}
+averagedPrediction[1:5,]
+
+# majority voting (> 2 pCR = pCR)
+finalPrediction_voted <- as.data.frame(matrix(nrow = nrow(meta.ganitumab), ncol = 4
+                                              ))
+rownames(finalPrediction_voted) <- rownames(features.gani)
+colnames(finalPrediction_voted) <- c("LogitBoost","NB","CL","Final")
+
+finalPrediction_voted$LogitBoost <- ifelse(logregLogitBoost.predict[,"pCR"] > 0.5, "pCR", "RD")
+finalPrediction_voted$NB <- ifelse(logregNB.predict[,"pCR"] > 0.5, "pCR", "RD")
+finalPrediction_voted$CL <- cl_class
+
+for(i in 1:length(meta.gani.pcr)) {
+  ifelse(sum(finalPrediction_voted[i,1:3] == "pCR") >= 2, 
+         finalPrediction_voted$Final[i] <- "pCR", finalPrediction_voted$Final[i] <- "RD")
+}
+finalPrediction_voted[1:5,]
+
+# performance
+par(pty = "s")
+roc(factor(meta.gani.pcr), averagedPrediction[,"pCR"],levels = c("RD","pCR"), direction = "<",
+    plot = T, asp = NA, col = "royalblue", lwd = 2, legacy.axes = T, print.auc = T,
+    main = "ROC curve for Majority Voting model in ISPY2 Ganitumab arm") # 0.628
+confusionMatrix(factor(finalPrediction_voted$Final), factor(meta.gani.pcr)) # 0.4, 0.8
+```
+
+### Interpretation
+
+```{r}
+# identify mis-classified cases
+finalPrediction_voted$Reference <- as.character(meta.gani.pcr) # true labels
+
+falsePositiveSamples <- rownames(finalPrediction_voted[finalPrediction_voted$Final == "pCR" & finalPrediction_voted$Reference == "RD", ]) # 15
+falseNegativeSamples <- rownames(finalPrediction_voted[finalPrediction_voted$Final == "RD" & finalPrediction_voted$Reference == "pCR", ]) # 14
+truePositiveSamples <- rownames(finalPrediction_voted[finalPrediction_voted$Final == "pCR" & finalPrediction_voted$Reference == "pCR", ]) # 10
+trueNegativeSamples <- rownames(finalPrediction_voted[finalPrediction_voted$Final == "RD" & finalPrediction_voted$Reference == "RD", ]) # 67
+
+# obtain corresponding expression profiles
+rna.gani.falsePos <- rna.expression.gani[,colnames(rna.expression.gani) %in% falsePositiveSamples]
+rna.gani.falseNeg <- rna.expression.gani[,colnames(rna.expression.gani) %in% falseNegativeSamples]
+dim(rna.gani.falseNeg)
+rna.gani.truePos <- rna.expression.gani[,colnames(rna.expression.gani) %in% truePositiveSamples]
+rna.gani.trueNeg <- rna.expression.gani[,colnames(rna.expression.gani) %in% trueNegativeSamples]
+dim(rna.gani.trueNeg)
+```
+
+```{r}
+# show prediction confidence probabilities
+finalPrediction_voted$LogitBoost.prob <- logregLogitBoost.predict[,"pCR"]
+finalPrediction_voted$NB.prob <- logregNB.predict[,"pCR"]
+finalPrediction_voted$CL.prob <- cl_vec
+falseNegativeSamples <- finalPrediction_voted[finalPrediction_voted$Final == "RD" & finalPrediction_voted$Reference == "pCR", ]
+
+# filter: samples with 3RD prediction
+FN_confidentProb <- falseNegativeSamples[falseNegativeSamples$LogitBoost == "RD" & falseNegativeSamples$NB == "RD" & falseNegativeSamples$CL == "RD", ] # 8 very wrong cases
+
+rna.gani.falseNeg <- rna.expression.gani[,colnames(rna.expression.gani) %in% rownames(FN_confidentProb)]
+dim(rna.gani.falseNeg)
+dim(rna.gani.truePos)
+```
+
+```{r}
+# DGE
+# combine trueNeg & falseNeg for comparing
+comparingCases <- cbind(rna.gani.falseNeg, rna.gani.truePos)
+truePrediction <- rep(0, ncol(rna.gani.falseNeg)) # if predicted pCR == true pCR
+truePrediction <- c(truePrediction, rep(1, ncol(rna.gani.truePos)))
+names(truePrediction) <- colnames(comparingCases)
+
+truePrediction
+```
+
+```{r}
+# design matrix
+response <- factor(truePrediction, levels=c(0,1), labels=c("falseNeg","truePos"))
+design <- model.matrix(~0 + response)
+rownames(design) <-colnames(comparingCases)
+contrast.matrix <- makeContrasts(responsetruePos-responsefalseNeg, levels = design)
+
+# fit linear model
+fit <- lmFit(comparingCases, design = design)
+fit <- contrasts.fit(fit, contrasts = contrast.matrix)
+efit <- eBayes(fit, trend = TRUE,robust = TRUE)
+degs_ebayes <- topTable(efit, adjust.method="BH", sort.by = "p", n=Inf, p.value = 1)
+
+# label significant genes
+treat_table <- degs_ebayes %>% 
+  mutate(expression = case_when(logFC >= 0 & adj.P.Val < 0.15 ~ "Up-regulated",
+                                logFC <= 0 & adj.P.Val < 0.15 ~ "Down-regulated",
+                                adj.P.Val>= 0.15 ~ "Not-DE"))
+
+print(degs_ebayes[1:10, ])
+print(treat_table[1:10, ])
+
+treat_table <- treat_table[order(treat_table$logFC), ]
+treat.ranked <- treat_table$logFC
+names(treat.ranked) <- rownames(treat_table)
+```
+
+```{r}
+ReactomePath <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/pathway lists/Reactome-3.7.Rds")
+
+# list pathways to exclude
+root <- c('R-HSA-162582' # signal transduction
+          )
+graph <- graph_from_data_frame(ReactomePath$relationships,directed = T)
+path  <- ego(graph, order=length(V(graph)), nodes=root, mode="out") # extract all downstream pathways
+toExclude <- names(unlist(path)) # 220 pathways to exclude
+graph <- make_ego_graph(graph, order=length(V(graph)), nodes=root, mode="out")
+
+# extract pathways
+ReactomePath$genesets <- ReactomePath$genesets[(ReactomePath$geneset.descriptions %in% toExclude)]
+ReactomePath$geneset.names <- ReactomePath$geneset.names[(ReactomePath$geneset.descriptions %in% toExclude)]
+ReactomePath$geneset.descriptions <- ReactomePath$geneset.descriptions[(ReactomePath$geneset.descriptions %in% toExclude)]
+names(ReactomePath$genesets) <- ReactomePath$geneset.names
+reactome.pathways <- ReactomePath$genesets # 447 pathways
+
+# filter out pathways which contain < 3 genes
+toExclude.short <- names(reactome.pathways)[sapply(reactome.pathways, length) < 3] # 10
+reactome.pathways <- reactome.pathways[!(names(reactome.pathways) %in% toExclude.short)]
+length(reactome.pathways) # 403 pathways (contain > 3 genes)
+```
+
+```{r}
+# singscore function calling
+reactome.scores.truePos <- calculateSingScore(expressionMatrix = rna.gani.truePos,
+                                          allPathways = reactome.pathways)
+reactome.scores.falseNeg <- calculateSingScore(expressionMatrix = rna.gani.falseNeg,
+                                          allPathways = reactome.pathways)
+reactome.scores.trueNeg <- calculateSingScore(expressionMatrix = rna.gani.trueNeg,
+                                          allPathways = reactome.pathways)
+reactome.scores.falsePos <- calculateSingScore(expressionMatrix = rna.gani.falsePos,
+                                          allPathways = reactome.pathways)
+```
+
+```{r}
+# wilcoxon test for all pathways
+wilcox.ganitumab <- sapply(1: length(reactome.pathways), function(i) {
+  wilcox.test(reactome.scores.truePos[,i], reactome.scores.falseNeg[,i], paired = F)$p.value
+  })
+
+# P value adjustment
+wilcox.ganitumab.adjusted <- p.adjust(wilcox.ganitumab, method="BH")
+table(wilcox.ganitumab.adjusted < 0.15) # 33
+
+ganitumabMarkers <- colnames(reactome.scores.falseNeg[,c(wilcox.ganitumab.adjusted < 0.15)])
+ganitumabMarkers
+```
+
+### Save signatures
+
+```{r}
+saveRDS(averagedPrediction[,"pCR"],"~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/predictions_Ganitumab.rds")
+saveRDS(ganitumabMarkers,"~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/biomarkers_Ganitumab.rds")
+```
+
+### Validation
+
+```{r}
+rna.gani.pcr <- rna.expression.gani[, colnames(rna.expression.gani) %in% rownames(meta.ganitumab[meta.ganitumab$pCR == 1, ])]
+rna.gani.rd <- rna.expression.gani[, !colnames(rna.expression.gani) %in% colnames(rna.gani.pcr)]
+dim(rna.gani.pcr)
+dim(rna.gani.rd)
+
+sigValidation.pcr <- calculateSingScore(expressionMatrix = rna.gani.pcr,
+                                        allPathways = reactome.pathways)
+sigValidation.rd <- calculateSingScore(expressionMatrix = rna.gani.rd,
+                                       allPathways = reactome.pathways)
+sigValidation.pcr <- sigValidation.pcr$`MAPK1 (ERK2) activation`
+sigValidation.rd <- sigValidation.rd$`MAPK1 (ERK2) activation`
+
+sigValidation.long <- data.frame(Class = factor(c(rep("pCR", length(sigValidation.pcr)),
+                                                  rep("RD", length(sigValidation.rd)))),
+                                 Value = c(sigValidation.pcr, sigValidation.rd))
+
+
+ggplot(sigValidation.long, aes(x = Class, y = Value, fill = Class)) +
+  geom_boxplot(width = 0.8) +
+  scale_fill_manual(values = c("#8abcd1","#a59aca")) +
+  stat_compare_means(
+    method = "t.test",
+    method.args = list(var.equal = TRUE),
+    label = "p.format",
+    size = 5.5,
+    label.x = 1.3
+  ) +
+  theme_classic() +
+  labs(title = "Ganitumab: MAPK1 (ERK2) activation", 
+       x = NULL, y = "Expression")+
+  theme(
+  aspect.ratio = 1,
+  axis.text = element_text(size = 20, colour = "black"),
+  axis.title = element_text(size = 20),
+  #legend.position = "none",
+  legend.text = element_text(size = 15),
+  legend.title = element_text(size = 15),
+  plot.title = element_text(size = 20, hjust = 0.5),
+  plot.margin = margin(10, 10, 10, 10)
+  )
+```
+
+## 4.4 Ganetespib arm
+### Pre-processing
+
+```{r}
+# select ganetespib arm
+meta.gane <- metadata[metadata$Arm == "Paclitaxel + Ganetespib",]
+
+# subset data
+rna.expression.gane <- rna.expression[ ,colnames(rna.expression) %in% rownames(meta.gane)]
+meta.gane <- meta.gane[rownames(meta.gane) %in% colnames(rna.expression),]
+meta.gane <- meta.gane[match(colnames(rna.expression.gane),rownames(meta.gane)),]
+stopifnot(sum(colnames(rna.expression.gane)!=rownames(meta.gane))==0)
+dim(rna.expression.gane) # 93 patients
+
+# retrieve pCR/RD info
+meta.gane.pcr <- ifelse(meta.gane$pCR == 0, "RD","pCR")
+
+table(meta.gane$`Receptor Subtype`) # 45 TNBC, 48 HR+HER2-
+table(meta.gane.pcr) # 25 pCR, 68 RD
+```
+
+### Extract features
+
+```{r}
+ReactomePath <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/pathway lists/Reactome-3.7.Rds")
+
+# extract reactome pathways
+root <- c('R-HSA-1640170', # cell cycle
+          'R-HSA-168256', # immune system
+          'R-HSA-1474244', # extracellular matrix organezation
+          'R-HSA-1500931') # cell-cell communication
+graph <- graph_from_data_frame(ReactomePath$relationships,directed = T)
+path  <- ego(graph, order=length(V(graph)), nodes=root, mode="out") # extract all downstream pathways
+toInclude <- names(unlist(path)) # 364 pathways to include
+graph <- make_ego_graph(graph, order=length(V(graph)), nodes=root, mode="out")
+
+# extract pathways
+ReactomePath$genesets <- ReactomePath$genesets[(ReactomePath$geneset.descriptions %in% toInclude)]
+ReactomePath$geneset.names <- ReactomePath$geneset.names[(ReactomePath$geneset.descriptions %in% toInclude)]
+ReactomePath$geneset.descriptions <- ReactomePath$geneset.descriptions[(ReactomePath$geneset.descriptions %in% toInclude)]
+names(ReactomePath$genesets) <- ReactomePath$geneset.names
+reactome.pathways <- ReactomePath$genesets # 364 pathways
+
+# filter out pathways which contain < 15 genes
+toExclude.short <- names(reactome.pathways)[sapply(reactome.pathways, length) < 15] # 18
+reactome.pathways <- reactome.pathways[!(names(reactome.pathways) %in% toExclude.short)]
+
+reactome.pathways <- reactome.pathways[names(reactome.pathways) %in% colnames(features.training)]
+length(reactome.pathways) # 17 selected features
+```
+
+```{r}
+# singscore function calling
+reactome.scores.gane <- calculateSingScore(expressionMatrix = rna.expression.gane,
+                                          allPathways = reactome.pathways)
+dim(reactome.scores.gane)
+
+# receptor status function calling
+receptorStatus.gane <- getExpressionVal(expressionMatrix = rna.expression.gane,
+                                        geneNames = c("ERBB2","ESR1","PGR"))
+dim(receptorStatus.gane)
+```
+
+```{r}
+# combine features
+features.gane <- cbind(reactome.scores.gane, receptorStatus.gane)
+
+scale.backup <- scale(features.gane[,18])
+for(i in 1:20) {
+  features.gane[,i] <- as.numeric(scale(features.gane[,i]))
+}
+stopifnot(as.numeric(scale.backup) == as.numeric(features.gane[,18]))
+boxplot(features.gane)
+```
+
+### Model application
+
+```{r}
+# predict
+logregLogitBoost.predict <- predict(logregFit.logitboost, features.gane, type = "prob")
+logregNB.predict <- predict(logregFit.nb, features.gane, type = "prob")
+```
+
+```{python}
+# load NN model weights
+ContrastiveModel = contrastive_neural(Dinput=20, Dembedding=16, p_drop = 0.2)
+classifier = DownstreamClassifier(encoder=ContrastiveModel, embedding_dim=16, num_classes=2)
+classifier.load_state_dict(torch.load("/Users/jleng/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/InProgress/ContrastiveLearningTrainedClassifier_extraLayer_ISPY2CtrTrain_frozen"))
+classifier.eval()
+```
+
+```{python}
+# prediction
+testing_tensor = torch.tensor(r.featuresganePy.values, dtype=torch.float32)
+
+with torch.no_grad():
+    logitsTesting = classifier(testing_tensor)
+    probsTesting = F.softmax(logitsTesting, dim=1)
+    probsTesting = probsTesting.numpy()
+
+pcr_probsTesting = probsTesting[:,1]
+```
+
+```{r}
+cl_vec <- py$pcr_probsTesting
+plot(density(cl_vec))
+cl_class <- ifelse(cl_vec>0.5, "pCR","RD")
+```
+
+```{r}
+# mean probability (for calculating AUC)
+averagedPrediction <- matrix(nrow = nrow(features.gane), ncol = 1)
+rownames(averagedPrediction) <- rownames(features.gane)
+colnames(averagedPrediction) <- "pCR"
+for(i in 1:nrow(averagedPrediction)) {
+  averagedPrediction[i,1] <- mean(c(logregLogitBoost.predict[i,1],
+                                    logregNB.predict[i,1],
+                                    cl_vec
+                                    ))
+}
+averagedPrediction[1:5,]
+
+# majority voting (> 2 pCR = pCR)
+finalPrediction_voted <- as.data.frame(matrix(nrow = nrow(meta.gane), ncol = 4
+                                              ))
+rownames(finalPrediction_voted) <- rownames(features.gane)
+colnames(finalPrediction_voted) <- c("LogitBoost","NB","CL","Final")
+
+finalPrediction_voted$LogitBoost <- ifelse(logregLogitBoost.predict[,"pCR"] > 0.5, "pCR", "RD")
+finalPrediction_voted$NB <- ifelse(logregNB.predict[,"pCR"] > 0.5, "pCR", "RD")
+finalPrediction_voted$CL <- cl_class
+
+for(i in 1:length(meta.gane.pcr)) {
+  ifelse(sum(finalPrediction_voted[i,1:3] == "pCR") >= 2, 
+         finalPrediction_voted$Final[i] <- "pCR", finalPrediction_voted$Final[i] <- "RD")
+}
+finalPrediction_voted[1:5,]
+
+# performance
+par(pty = "s")
+roc(factor(meta.gane.pcr), averagedPrediction[,"pCR"],levels = c("RD","pCR"), direction = "<",
+    plot = T, asp = NA, col = "royalblue", lwd = 2, legacy.axes = T, print.auc = T,
+    main = "ROC curve for Majority Voting model in ISPY2 gane386 arm") # 0.613
+confusionMatrix(factor(finalPrediction_voted$Final), factor(meta.gane.pcr)) # 0.28, 0.779
+```
+
+### Interpretation
+
+```{r}
+# identify mis-classified cases
+finalPrediction_voted$Reference <- as.character(meta.gane.pcr) # true labels
+
+falsePositiveSamples <- rownames(finalPrediction_voted[finalPrediction_voted$Final == "pCR" & finalPrediction_voted$Reference == "RD", ]) # 15
+falseNegativeSamples <- rownames(finalPrediction_voted[finalPrediction_voted$Final == "RD" & finalPrediction_voted$Reference == "pCR", ]) # 18
+truePositiveSamples <- rownames(finalPrediction_voted[finalPrediction_voted$Final == "pCR" & finalPrediction_voted$Reference == "pCR", ]) # 7
+trueNegativeSamples <- rownames(finalPrediction_voted[finalPrediction_voted$Final == "RD" & finalPrediction_voted$Reference == "RD", ]) # 53
+
+# obtain corresponding expression profiles
+rna.gane.falsePos <- rna.expression.gane[,colnames(rna.expression.gane) %in% falsePositiveSamples]
+rna.gane.falseNeg <- rna.expression.gane[,colnames(rna.expression.gane) %in% falseNegativeSamples]
+dim(rna.gane.falseNeg)
+rna.gane.truePos <- rna.expression.gane[,colnames(rna.expression.gane) %in% truePositiveSamples]
+rna.gane.trueNeg <- rna.expression.gane[,colnames(rna.expression.gane) %in% trueNegativeSamples]
+dim(rna.gane.truePos)
+```
+
+```{r}
+# show prediction confidence probabilities
+finalPrediction_voted$LogitBoost.prob <- logregLogitBoost.predict[,"pCR"]
+finalPrediction_voted$NB.prob <- logregNB.predict[,"pCR"]
+finalPrediction_voted$CL.prob <- cl_vec
+falseNegativeSamples <- finalPrediction_voted[finalPrediction_voted$Final == "RD" & finalPrediction_voted$Reference == "pCR", ]
+
+# filter: samples with 3RD prediction
+FN_confidentProb <- falseNegativeSamples[falseNegativeSamples$LogitBoost == "RD" & falseNegativeSamples$NB == "RD" & falseNegativeSamples$CL == "RD", ] # 12 very wrong cases
+
+rna.gane.falseNeg <- rna.expression.gane[,colnames(rna.expression.gane) %in% rownames(FN_confidentProb)]
+dim(rna.gane.falseNeg)
+dim(rna.gane.truePos)
+```
+
+```{r}
+# DGE
+# combine truePos & falseNeg for comparing
+comparingCases <- cbind(rna.gane.falseNeg, rna.gane.truePos)
+truePrediction <- rep(0, ncol(rna.gane.falseNeg)) # if predicted pCR == true pCR
+truePrediction <- c(truePrediction, rep(1, ncol(rna.gane.truePos)))
+names(truePrediction) <- colnames(comparingCases)
+truePrediction
+```
+
+```{r}
+# design matrix
+response <- factor(truePrediction, levels=c(0,1), labels=c("falseNeg","truePos"))
+design <- model.matrix(~0 + response)
+rownames(design) <-colnames(comparingCases)
+contrast.matrix <- makeContrasts(responsetruePos-responsefalseNeg, levels = design)
+
+# fit linear model
+fit <- lmFit(comparingCases, design = design)
+fit <- contrasts.fit(fit, contrasts = contrast.matrix)
+efit <- eBayes(fit, trend = TRUE,robust = TRUE)
+degs_ebayes <- topTable(efit, adjust.method="BH", sort.by = "p", n=Inf, p.value = 1)
+
+# label significant genes
+treat_table <- degs_ebayes %>% 
+  mutate(expression = case_when(logFC >= 0 & adj.P.Val < 0.15 ~ "Up-regulated",
+                                logFC <= 0 & adj.P.Val < 0.15 ~ "Down-regulated",
+                                adj.P.Val>= 0.15 ~ "Not-DE"))
+
+print(degs_ebayes[1:10, ])
+print(treat_table[1:10, ])
+table(treat_table$expression)
+
+treat_table <- treat_table[order(treat_table$logFC), ]
+treat.ranked <- treat_table$logFC
+names(treat.ranked) <- rownames(treat_table)
+```
+
+```{r}
+ReactomePath <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/pathway lists/Reactome-3.7.Rds")
+
+# list pathways to exclude
+root <- c('R-HSA-8953897' # cellular responses to stimuli
+          )
+graph <- graph_from_data_frame(ReactomePath$relationships,directed = T)
+path  <- ego(graph, order=length(V(graph)), nodes=root, mode="out") # extract all downstream pathways
+toExclude <- names(unlist(path)) # 51 pathways to exclude
+graph <- make_ego_graph(graph, order=length(V(graph)), nodes=root, mode="out")
+
+# extract pathways
+ReactomePath$genesets <- ReactomePath$genesets[(ReactomePath$geneset.descriptions %in% toExclude)]
+ReactomePath$geneset.names <- ReactomePath$geneset.names[(ReactomePath$geneset.descriptions %in% toExclude)]
+ReactomePath$geneset.descriptions <- ReactomePath$geneset.descriptions[(ReactomePath$geneset.descriptions %in% toExclude)]
+names(ReactomePath$genesets) <- ReactomePath$geneset.names
+reactome.pathways <- ReactomePath$genesets # 51 pathways
+
+# filter out pathways which contain < 3 genes
+toExclude.short <- names(reactome.pathways)[sapply(reactome.pathways, length) < 3] # 10
+reactome.pathways <- reactome.pathways[!(names(reactome.pathways) %in% toExclude.short)]
+length(reactome.pathways) # 51 pathways (contain > 3 genes)
+```
+
+```{r}
+# singscore function calling
+reactome.scores.truePos <- calculateSingScore(expressionMatrix = rna.gane.truePos,
+                                          allPathways = reactome.pathways)
+reactome.scores.falseNeg <- calculateSingScore(expressionMatrix = rna.gane.falseNeg,
+                                          allPathways = reactome.pathways)
+reactome.scores.trueNeg <- calculateSingScore(expressionMatrix = rna.gane.trueNeg,
+                                          allPathways = reactome.pathways)
+reactome.scores.falsePos <- calculateSingScore(expressionMatrix = rna.gane.falsePos,
+                                          allPathways = reactome.pathways)
+```
+
+```{r}
+# wilcoxon test for all pathways
+wilcox.gane <- sapply(1: length(reactome.pathways), function(i) {
+  wilcox.test(reactome.scores.truePos[,i], reactome.scores.falseNeg[,i], paired = F)$p.value
+  })
+
+# P value adjustment
+wilcox.gane.adjusted <- p.adjust(wilcox.gane, method="BH")
+table(wilcox.gane.adjusted < 0.15) # 6
+
+colnames(reactome.scores.falseNeg[,c(wilcox.gane.adjusted < 0.15)])
+ganeMarkers <- colnames(reactome.scores.falseNeg[,c(wilcox.gane.adjusted < 0.15)])
+```
+
+### Save signatures
+
+```{r}
+saveRDS(averagedPrediction[,"pCR"],"~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/predictions_Ganetespib.rds")
+saveRDS(ganeMarkers,"~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/biomarkers_Ganetespib.rds")
+```
+
+### Validation
+
+```{r}
+rna.gane.pcr <- rna.expression.gane[, colnames(rna.expression.gane) %in% rownames(meta.gane[meta.gane$pCR == 1, ])]
+rna.gane.rd <- rna.expression.gane[, !colnames(rna.expression.gane) %in% colnames(rna.gane.pcr)]
+dim(rna.gane.pcr)
+dim(rna.gane.rd)
+
+sigValidation.pcr <- calculateSingScore(expressionMatrix = rna.gane.pcr,
+                                        allPathways = reactome.pathways)
+sigValidation.rd <- calculateSingScore(expressionMatrix = rna.gane.rd,
+                                       allPathways = reactome.pathways)
+sigValidation.pcr <- sigValidation.pcr$`Regulation of NFE2L2 gene expression`
+sigValidation.rd <- sigValidation.rd$`Regulation of NFE2L2 gene expression`
+
+sigValidation.long <- data.frame(Class = factor(c(rep("pCR", length(sigValidation.pcr)),
+                                                  rep("RD", length(sigValidation.rd)))),
+                                 Value = c(sigValidation.pcr, sigValidation.rd))
+```
+
+```{r}
+ggplot(sigValidation.long, aes(x = Class, y = Value, fill = Class)) +
+  geom_boxplot(width = 0.8) +
+  scale_fill_manual(values = c("#8abcd1","#a59aca")) +
+  stat_compare_means(
+    method = "t.test",
+    method.args = list(var.equal = TRUE),
+    label = "p.format",
+    size = 5.5,
+    label.x = 1.3
+  ) +
+  theme_classic() +
+  labs(title = "Ganetespib: Regulation of NFE2L2 gene expression", 
+       x = NULL, y = "Expression")+
+  theme(
+  aspect.ratio = 1,
+  axis.text = element_text(size = 20, colour = "black"),
+  axis.title = element_text(size = 20),
+  legend.position = "none",
+  # legend.text = element_text(size = 15),
+  # legend.title = element_text(size = 15),
+  plot.title = element_text(size = 20, hjust = 0.5),
+  plot.margin = margin(10, 10, 10, 10)
+  )
+```
+
+## 4.5 Pembrolizumab arm
+### Pre-processing
+
+```{r}
+# select pembrolizumab arm
+meta.pemb <- metadata[metadata$Arm == "Paclitaxel + Pembrolizumab",]
+
+# subset data
+rna.expression.pemb <- rna.expression[ ,colnames(rna.expression) %in% rownames(meta.pemb)]
+meta.pemb <- meta.pemb[rownames(meta.pemb) %in% colnames(rna.expression),]
+meta.pemb <- meta.pemb[match(colnames(rna.expression.pemb),rownames(meta.pemb)),]
+stopifnot(sum(colnames(rna.expression.pemb)!=rownames(meta.pemb))==0)
+dim(rna.expression.pemb) # 69 patients
+
+# retrieve pCR/RD info
+meta.pemb.pcr <- ifelse(meta.pemb$pCR == 0, "RD","pCR")
+
+table(meta.pemb$`Receptor Subtype`) # 29 TNBC, 40 HR+HER2-
+table(meta.pemb.pcr) # 31 pCR, 38 RD
+```
+
+### Extract features
+
+```{r}
+ReactomePath <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/pathway lists/Reactome-3.7.Rds")
+
+# extract reactome pathways
+root <- c('R-HSA-1640170', # cell cycle
+          'R-HSA-168256', # immune system
+          'R-HSA-1474244', # extracellular matrix organization
+          'R-HSA-1500931') # cell-cell communication
+graph <- graph_from_data_frame(ReactomePath$relationships,directed = T)
+path  <- ego(graph, order=length(V(graph)), nodes=root, mode="out") # extract all downstream pathways
+toInclude <- names(unlist(path)) # 364 pathways to include
+graph <- make_ego_graph(graph, order=length(V(graph)), nodes=root, mode="out")
+
+# extract pathways
+ReactomePath$genesets <- ReactomePath$genesets[(ReactomePath$geneset.descriptions %in% toInclude)]
+ReactomePath$geneset.names <- ReactomePath$geneset.names[(ReactomePath$geneset.descriptions %in% toInclude)]
+ReactomePath$geneset.descriptions <- ReactomePath$geneset.descriptions[(ReactomePath$geneset.descriptions %in% toInclude)]
+names(ReactomePath$genesets) <- ReactomePath$geneset.names
+reactome.pathways <- ReactomePath$genesets # 364 pathways
+
+# filter out pathways which contain < 15 genes
+toExclude.short <- names(reactome.pathways)[sapply(reactome.pathways, length) < 15]
+reactome.pathways <- reactome.pathways[!(names(reactome.pathways) %in% toExclude.short)]
+
+reactome.pathways <- reactome.pathways[names(reactome.pathways) %in% colnames(features.training)]
+length(reactome.pathways) # 17 selected features
+```
+
+```{r}
+# singscore function calling
+reactome.scores.pemb <- calculateSingScore(expressionMatrix = rna.expression.pemb,
+                                          allPathways = reactome.pathways)
+dim(reactome.scores.pemb)
+
+# receptor status function calling
+receptorStatus.pemb <- getExpressionVal(expressionMatrix = rna.expression.pemb,
+                                        geneNames = c("ERBB2","ESR1","PGR"))
+dim(receptorStatus.pemb)
+```
+
+```{r}
+# combine features
+features.pemb <- cbind(reactome.scores.pemb, receptorStatus.pemb)
+
+scale.backup <- scale(features.pemb[,18])
+for(i in 1:20) {
+  features.pemb[,i] <- as.numeric(scale(features.pemb[,i]))
+}
+stopifnot(as.numeric(scale.backup) == as.numeric(features.pemb[,18]))
+boxplot(features.pemb)
+```
+
+### Model application
+
+```{r}
+# predict
+logregLogitBoost.predict <- predict(logregFit.logitboost, features.pemb, type = "prob")
+logregNB.predict <- predict(logregFit.nb, features.pemb, type = "prob")
+```
+
+```{python}
+# load NN model weights
+ContrastiveModel = contrastive_neural(Dinput=20, Dembedding=16, p_drop = 0.2)
+classifier = DownstreamClassifier(encoder=ContrastiveModel, embedding_dim=16, num_classes=2)
+classifier.load_state_dict(torch.load("/Users/jleng/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/InProgress/ContrastiveLearningTrainedClassifier_extraLayer_ISPY2CtrTrain_frozen"))
+classifier.eval()
+```
+
+```{python}
+# prediction
+testing_tensor = torch.tensor(r.featurespembPy.values, dtype=torch.float32)
+
+with torch.no_grad():
+    logitsTesting = classifier(testing_tensor)
+    probsTesting = F.softmax(logitsTesting, dim=1)
+    probsTesting = probsTesting.numpy()
+
+pcr_probsTesting = probsTesting[:,1]
+```
+
+```{r}
+cl_vec <- py$pcr_probsTesting
+plot(density(cl_vec))
+cl_class <- ifelse(cl_vec>0.5, "pCR","RD")
+```
+
+```{r}
+# mean probability (for calculating AUC)
+averagedPrediction <- matrix(nrow = nrow(features.pemb), ncol = 1)
+rownames(averagedPrediction) <- rownames(features.pemb)
+colnames(averagedPrediction) <- "pCR"
+for(i in 1:nrow(averagedPrediction)) {
+  averagedPrediction[i,1] <- mean(c(logregLogitBoost.predict[i,1],
+                                    logregNB.predict[i,1],
+                                    cl_vec
+                                    ))
+}
+averagedPrediction[1:5,]
+
+# majority voting (> 2 pCR = pCR)
+finalPrediction_voted <- as.data.frame(matrix(nrow = nrow(meta.pemb), ncol = 4
+                                              ))
+rownames(finalPrediction_voted) <- rownames(features.pemb)
+colnames(finalPrediction_voted) <- c("LogitBoost","NB","CL","Final")
+
+finalPrediction_voted$LogitBoost <- ifelse(logregLogitBoost.predict[,"pCR"] > 0.5, "pCR", "RD")
+finalPrediction_voted$NB <- ifelse(logregNB.predict[,"pCR"] > 0.5, "pCR", "RD")
+finalPrediction_voted$CL <- cl_class
+
+for(i in 1:length(meta.pemb.pcr)) {
+  ifelse(sum(finalPrediction_voted[i,1:3] == "pCR") >= 2, 
+         finalPrediction_voted$Final[i] <- "pCR", finalPrediction_voted$Final[i] <- "RD")
+}
+finalPrediction_voted[1:5,]
+
+# performance
+par(pty = "s")
+roc(factor(meta.pemb.pcr), averagedPrediction[,"pCR"],levels = c("RD","pCR"), direction = "<",
+    plot = T, asp = NA, col = "royalblue", lwd = 2, legacy.axes = T, print.auc = T,
+    main = "ROC curve for Majority Voting model in ISPY2 Pembrolizumab arm") # 0.741
+confusionMatrix(factor(finalPrediction_voted$Final), factor(meta.pemb.pcr)) # 0.22, 0.89
+```
+
+### Interpretation
+
+```{r}
+# identify mis-classified cases
+finalPrediction_voted$Reference <- as.character(meta.pemb.pcr) # true labels
+
+falsePositiveSamples <- rownames(finalPrediction_voted[finalPrediction_voted$Final == "pCR" & finalPrediction_voted$Reference == "RD", ]) # 4
+falseNegativeSamples <- rownames(finalPrediction_voted[finalPrediction_voted$Final == "RD" & finalPrediction_voted$Reference == "pCR", ]) # 24
+truePositiveSamples <- rownames(finalPrediction_voted[finalPrediction_voted$Final == "pCR" & finalPrediction_voted$Reference == "pCR", ]) # 7
+trueNegativeSamples <- rownames(finalPrediction_voted[finalPrediction_voted$Final == "RD" & finalPrediction_voted$Reference == "RD", ]) # 34
+
+# obtain corresponding expression profiles
+rna.pemb.falsePos <- rna.expression.pemb[,colnames(rna.expression.pemb) %in% falsePositiveSamples]
+rna.pemb.falseNeg <- rna.expression.pemb[,colnames(rna.expression.pemb) %in% falseNegativeSamples]
+dim(rna.pemb.falseNeg)
+rna.pemb.truePos <- rna.expression.pemb[,colnames(rna.expression.pemb) %in% truePositiveSamples]
+rna.pemb.trueNeg <- rna.expression.pemb[,colnames(rna.expression.pemb) %in% trueNegativeSamples]
+dim(rna.pemb.truePos)
+```
+
+```{r}
+# show prediction confidence probabilities
+finalPrediction_voted$LogitBoost.prob <- logregLogitBoost.predict[,"pCR"]
+finalPrediction_voted$NB.prob <- logregNB.predict[,"pCR"]
+finalPrediction_voted$CL.prob <- cl_vec
+falseNegativeSamples <- finalPrediction_voted[finalPrediction_voted$Final == "RD" & finalPrediction_voted$Reference == "pCR", ]
+
+# filter: samples with 3RD prediction
+FN_confidentProb <- falseNegativeSamples[falseNegativeSamples$LogitBoost == "RD" & falseNegativeSamples$NB == "RD" & falseNegativeSamples$CL == "RD", ] # 9 very wrong cases
+
+rna.pemb.falseNeg <- rna.expression.pemb[,colnames(rna.expression.pemb) %in% rownames(FN_confidentProb)]
+dim(rna.pemb.falseNeg)
+dim(rna.pemb.truePos)
+```
+
+```{r}
+# DGE
+# combine truePos & falseNeg for comparing
+comparingCases <- cbind(rna.pemb.falseNeg, rna.pemb.truePos)
+truePrediction <- rep(0, ncol(rna.pemb.falseNeg)) # if predicted pCR == true pCR
+truePrediction <- c(truePrediction, rep(1, ncol(rna.pemb.truePos)))
+names(truePrediction) <- colnames(comparingCases)
+truePrediction
+```
+
+```{r}
+# design matrix
+response <- factor(truePrediction, levels=c(0,1), labels=c("falseNeg","truePos"))
+design <- model.matrix(~0 + response)
+rownames(design) <-colnames(comparingCases)
+contrast.matrix <- makeContrasts(responsetruePos-responsefalseNeg, levels = design)
+
+# fit linear model
+fit <- lmFit(comparingCases, design = design)
+fit <- contrasts.fit(fit, contrasts = contrast.matrix)
+efit <- eBayes(fit, trend = TRUE,robust = TRUE)
+degs_ebayes <- topTable(efit, adjust.method="BH", sort.by = "p", n=Inf, p.value = 1)
+
+# label significant genes
+treat_table <- degs_ebayes %>% 
+  mutate(expression = case_when(logFC >= 0 & adj.P.Val < 0.15 ~ "Up-regulated",
+                                logFC <= 0 & adj.P.Val < 0.15 ~ "Down-regulated",
+                                adj.P.Val>= 0.15 ~ "Not-DE"))
+
+print(degs_ebayes[1:10, ])
+print(treat_table[1:10, ])
+table(treat_table$expression)
+
+treat_table <- treat_table[order(treat_table$logFC), ]
+treat.ranked <- treat_table$logFC
+names(treat.ranked) <- rownames(treat_table)
+```
+
+```{r}
+ReactomePath <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/pathway lists/Reactome-3.7.Rds")
+
+# list pathways to exclude
+root <- c('R-HSA-168256' # immune system
+          )
+graph <- graph_from_data_frame(ReactomePath$relationships,directed = T)
+path  <- ego(graph, order=length(V(graph)), nodes=root, mode="out") # extract all downstream pathways
+toExclude <- names(unlist(path)) # 51 pathways to exclude
+graph <- make_ego_graph(graph, order=length(V(graph)), nodes=root, mode="out")
+
+# extract pathways
+ReactomePath$genesets <- ReactomePath$genesets[(ReactomePath$geneset.descriptions %in% toExclude)]
+ReactomePath$geneset.names <- ReactomePath$geneset.names[(ReactomePath$geneset.descriptions %in% toExclude)]
+ReactomePath$geneset.descriptions <- ReactomePath$geneset.descriptions[(ReactomePath$geneset.descriptions %in% toExclude)]
+names(ReactomePath$genesets) <- ReactomePath$geneset.names
+reactome.pathways <- ReactomePath$genesets # 198
+
+# filter out pathways which contain < 3 genes
+toExclude.short <- names(reactome.pathways)[sapply(reactome.pathways, length) < 3] # 10
+reactome.pathways <- reactome.pathways[!(names(reactome.pathways) %in% toExclude.short)]
+length(reactome.pathways) # 195 pathways (contain > 3 genes)
+```
+
+```{r}
+# singscore function calling
+reactome.scores.truePos <- calculateSingScore(expressionMatrix = rna.pemb.truePos,
+                                          allPathways = reactome.pathways)
+reactome.scores.falseNeg <- calculateSingScore(expressionMatrix = rna.pemb.falseNeg,
+                                          allPathways = reactome.pathways)
+reactome.scores.trueNeg <- calculateSingScore(expressionMatrix = rna.pemb.trueNeg,
+                                          allPathways = reactome.pathways)
+reactome.scores.falsePos <- calculateSingScore(expressionMatrix = rna.pemb.falsePos,
+                                          allPathways = reactome.pathways)
+```
+
+```{r}
+# wilcoxon test for all pathways
+wilcox.pemb <- sapply(1: length(reactome.pathways), function(i) {
+  wilcox.test(reactome.scores.truePos[,i], reactome.scores.falseNeg[,i], paired = F)$p.value
+  })
+
+# P value adjustment
+wilcox.pemb.adjusted <- p.adjust(wilcox.pemb, method="BH")
+table(wilcox.pemb.adjusted < 0.15) # 7
+
+colnames(reactome.scores.falseNeg[,c(wilcox.pemb.adjusted < 0.15)])
+# NF-kB and IFN signatues were picked up (adaptive immune response)
+# efficacy of pembrolizumab depends on antigen-rich TME.
+```
+
+```{r}
+# save identified biomarkers
+biomarkers.pemb <- colnames(reactome.scores.falseNeg[,c(wilcox.pemb.adjusted < 0.15)])
+saveRDS(biomarkers.pemb,"~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/biomarkers_Pembrolizumab.rds")
+
+saveRDS(averagedPrediction[,"pCR"],"~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/predictions_Pembrolizumab.rds")
+```
+
+### Validation
+
+```{r}
+rna.pemb.pcr <- rna.expression.pemb[, colnames(rna.expression.pemb) %in% rownames(meta.pemb[meta.pemb$pCR == 1, ])]
+rna.pemb.rd <- rna.expression.pemb[, !colnames(rna.expression.pemb) %in% colnames(rna.pemb.pcr)]
+dim(rna.pemb.pcr)
+dim(rna.pemb.rd)
+sigValidation.pcr <- calculateSingScore(expressionMatrix = rna.pemb.pcr,
+                                        allPathways = reactome.pathways)
+sigValidation.rd <- calculateSingScore(expressionMatrix = rna.pemb.rd,
+                                       allPathways = reactome.pathways)
+sigValidation.pcr <- sigValidation.pcr$`Activation of NF-kappaB in B cells`
+sigValidation.rd <- sigValidation.rd$`Activation of NF-kappaB in B cells`
+
+sigValidation.long <- data.frame(Class = factor(c(rep("pCR", length(sigValidation.pcr)),
+                                                  rep("RD", length(sigValidation.rd)))),
+                                 Value = c(sigValidation.pcr, sigValidation.rd))
+```
+
+```{r}
+ggplot(sigValidation.long, aes(x = Class, y = Value, fill = Class)) +
+  geom_boxplot(width = 0.8) +
+  scale_fill_manual(values = c("#8abcd1","#a59aca")) +
+  stat_compare_means(
+    method = "t.test",
+    method.args = list(var.equal = TRUE),
+    label = "p.format",
+    size = 5.5,
+    label.x = 1.3
+  ) +
+  theme_classic() +
+  labs(title = "Pembrolizumab: Activation of NF-kappaB in B cells", 
+       x = NULL, y = "Expression")+
+  theme(
+  aspect.ratio = 1,
+  axis.text = element_text(size = 20, colour = "black"),
+  axis.title = element_text(size = 20),
+  #legend.position = "none",
+  legend.text = element_text(size = 15),
+  legend.title = element_text(size = 15),
+  plot.title = element_text(size = 20, hjust = 0.5),
+  plot.margin = margin(10, 10, 10, 10)
+  )
+```
+
+# 5. Validation
+## 5.1 Comparison with traditional approaches
+
+```{r}
+# loading saved data
+rna.expression <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/ISPY2/RNA/expression/mRNA_array_hugo.RData")
+meta.neratinib <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/InProgress/metaNeratinib_ISPY2treatArm")
+meta.amg <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/InProgress/metaAMG386_ISPY2treatArm")
+meta.ganitumab <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/InProgress/metaGanizumab_ISPY2treatArm")
+meta.gane <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/InProgress/metaGanetispib_ISPY2treatArm")
+meta.pemb <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/InProgress/metaPembrolizumab_ISPY2treatArm")
+ReactomePath <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/pathway lists/Reactome-3.7.Rds")
+```
+
+### Pre-processing
+
+```{r}
+rna.expression.nera <- rna.expression[ ,colnames(rna.expression) %in% rownames(meta.neratinib)]
+meta.neratinib.pcr <- ifelse(meta.neratinib$pCR == 0, "RD","pCR")
+
+meta.neratinib <- meta.neratinib[meta.neratinib$`Receptor Subtype`== "HR+HER2-" | meta.neratinib$`Receptor Subtype`== "TN", ] # 49 samples (32TN, 17HR+HER2-)
+rna.expression.nera <- rna.expression[ ,colnames(rna.expression) %in% rownames(meta.neratinib)]
+dim(rna.expression.nera)
+meta.neratinib.pcr <- ifelse(meta.neratinib$pCR == 0, "RD","pCR")
+```
+
+```{r}
+rna.expression.amg <- rna.expression[ ,colnames(rna.expression) %in% rownames(meta.amg)]
+meta.amg.pcr <- ifelse(meta.neratinib$pCR == 0, "RD","pCR")
+rna.expression.gani <- rna.expression[ ,colnames(rna.expression) %in% rownames(meta.ganitumab)]
+meta.gani.pcr <- ifelse(meta.neratinib$pCR == 0, "RD","pCR")
+rna.expression.gane <- rna.expression[ ,colnames(rna.expression) %in% rownames(meta.gane)]
+meta.gane.pcr <- ifelse(meta.neratinib$pCR == 0, "RD","pCR")
+rna.expression.pemb <- rna.expression[ ,colnames(rna.expression) %in% rownames(meta.pemb)]
+meta.pemb.pcr <- ifelse(meta.neratinib$pCR == 0, "RD","pCR")
+```
+
+```{r}
+ReactomePath <- readRDS("~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/resources/pathway lists/Reactome-3.7.Rds")
+
+root <- c('R-HSA-162582' # signal transduction
+          )
+graph <- graph_from_data_frame(ReactomePath$relationships,directed = T)
+path  <- ego(graph, order=length(V(graph)), nodes=root, mode="out") # extract all downstream pathways
+toExclude <- names(unlist(path)) # 220 pathways to exclude
+graph <- make_ego_graph(graph, order=length(V(graph)), nodes=root, mode="out")
+
+# extract pathways
+ReactomePath$genesets <- ReactomePath$genesets[(ReactomePath$geneset.descriptions %in% toExclude)]
+ReactomePath$geneset.names <- ReactomePath$geneset.names[(ReactomePath$geneset.descriptions %in% toExclude)]
+ReactomePath$geneset.descriptions <- ReactomePath$geneset.descriptions[(ReactomePath$geneset.descriptions %in% toExclude)]
+names(ReactomePath$genesets) <- ReactomePath$geneset.names
+reactome.pathways <- ReactomePath$genesets # 447 pathways
+
+# filter out pathways which contain < 3 genes
+toExclude.short <- names(reactome.pathways)[sapply(reactome.pathways, length) < 3] # 10
+reactome.pathways <- reactome.pathways[!(names(reactome.pathways) %in% toExclude.short)]
+length(reactome.pathways) # 403 pathways (contain > 3 genes)
+```
+
+### DGE-GSEA: Neratinib
+
+```{r}
+# design matrix
+response <- factor(meta.neratinib$pCR, levels=c(0,1), labels=c("RD","pCR"))
+design <- model.matrix(~0 + response)
+rownames(design) <-rownames(meta.neratinib)
+contrast.matrix <- makeContrasts(responsepCR-responseRD, levels = design)
+
+# fit linear model
+fit <- lmFit(rna.expression.nera, design = design)
+fit <- contrasts.fit(fit, contrasts = contrast.matrix)
+efit <- eBayes(fit, trend = TRUE,robust = TRUE)
+degs_ebayes <- topTable(efit, adjust.method="BH", sort.by = "p", n=Inf, p.value = 1)
+
+# label significant genes
+treat_table <- degs_ebayes %>% 
+  mutate(expression = case_when(logFC >= 0 & adj.P.Val < 0.15 ~ "Up-regulated",
+                                logFC <= 0 & adj.P.Val < 0.15 ~ "Down-regulated",
+                                adj.P.Val>= 0.15 ~ "Not-DE"))
+
+print(degs_ebayes[1:10, ])
+print(treat_table[1:10, ]) # DE with updated threshold: 0
+```
+
+```{r}
+# rank all the genes by fold change
+treat_table <- treat_table[order(treat_table$logFC), ]
+treat.ranked <- treat_table$logFC
+names(treat.ranked) <- rownames(treat_table)
+```
+
+```{r}
+# perform enrichment analysis
+fgseaRes <- fgsea(pathways = reactome.pathways, 
+                  stats    = treat.ranked,
+                  minSize  = 15,
+                  maxSize  = 400)
+fgseaRes<-fgseaRes[fgseaRes$padj<0.15,] # significant pathways: 4
+fgseaRes <- fgseaRes[order(fgseaRes$NES, decreasing = T), ]
+
+print(fgseaRes$pathway)
+# enriched pathways do not contain expected signatures (ERBB2)
+# suggesting that the ML model outperformed by picking up more informative biomarkers
+```
+
+```{r}
+saveRDS(fgseaRes,"~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/enrichedPathwaysNeratinib_traditionalApproach.rds")
+```
+
+### DGE-GSEA: AMG386
+
+```{r}
+# design matrix
+response <- factor(meta.amg$pCR, levels=c(0,1), labels=c("RD","pCR"))
+design <- model.matrix(~0 + response)
+rownames(design) <-rownames(meta.amg)
+contrast.matrix <- makeContrasts(responsepCR-responseRD, levels = design)
+
+# fit linear model
+fit <- lmFit(rna.expression.amg, design = design)
+fit <- contrasts.fit(fit, contrasts = contrast.matrix)
+efit <- eBayes(fit, trend = TRUE,robust = TRUE)
+degs_ebayes <- topTable(efit, adjust.method="BH", sort.by = "p", n=Inf, p.value = 1)
+
+# label significant genes
+treat_table <- degs_ebayes %>% 
+  mutate(expression = case_when(logFC >= 0 & adj.P.Val < 0.15 ~ "Up-regulated",
+                                logFC <= 0 & adj.P.Val < 0.15 ~ "Down-regulated",
+                                adj.P.Val>= 0.15 ~ "Not-DE"))
+
+print(degs_ebayes[1:10, ])
+print(treat_table[1:10, ])
+```
+
+```{r}
+# rank all the genes by fold change
+treat_table <- treat_table[order(treat_table$logFC), ]
+treat_table <- treat_table[!treat_table$expression == "Not-DE", ] # 716 DE genes
+
+treat.ranked <- treat_table$logFC
+names(treat.ranked) <- rownames(treat_table)
+```
+
+```{r}
+# perform enrichment analysis
+fgseaRes <- fgsea(pathways = reactome.pathways, 
+                  stats    = treat.ranked,
+                  minSize  = 15,
+                  maxSize  = 400)
+fgseaRes<-fgseaRes[fgseaRes$padj<0.15,] # significant pathways: 4
+fgseaRes <- fgseaRes[order(fgseaRes$NES, decreasing = T), ]
+
+print(fgseaRes$pathway)
+# enriched pathways do not contain expected signatures (ERBB2)
+# suggesting that the ML model outperformed by picking up more informative biomarkers
+```
+
+```{r}
+saveRDS(fgseaRes,"~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/enrichedPathwaysAMG386_traditionalApproach.rds")
+```
+
+### DGE-GSEA: Ganitumab
+
+```{r}
+# design matrix
+response <- factor(meta.ganitumab$pCR, levels=c(0,1), labels=c("RD","pCR"))
+design <- model.matrix(~0 + response)
+rownames(design) <-rownames(meta.ganitumab)
+contrast.matrix <- makeContrasts(responsepCR-responseRD, levels = design)
+
+# fit linear model
+fit <- lmFit(rna.expression.gani, design = design)
+fit <- contrasts.fit(fit, contrasts = contrast.matrix)
+efit <- eBayes(fit, trend = TRUE,robust = TRUE)
+degs_ebayes <- topTable(efit, adjust.method="BH", sort.by = "p", n=Inf, p.value = 1)
+
+# label significant genes
+treat_table <- degs_ebayes %>% 
+  mutate(expression = case_when(logFC >= 0 & adj.P.Val < 0.15 ~ "Up-regulated",
+                                logFC <= 0 & adj.P.Val < 0.15 ~ "Down-regulated",
+                                adj.P.Val>= 0.15 ~ "Not-DE"))
+
+print(degs_ebayes[1:10, ])
+print(treat_table[1:10, ]) # DE with updated threshold: 0
+```
+
+```{r}
+# rank all the genes by fold change
+treat_table <- treat_table[!treat_table$expression == "Not-DE", ] # 365
+treat_table <- treat_table[order(treat_table$logFC), ]
+treat.ranked <- treat_table$logFC
+names(treat.ranked) <- rownames(treat_table)
+```
+
+```{r}
+# perform enrichment analysis
+fgseaRes <- fgsea(pathways = reactome.pathways, 
+                  stats    = treat.ranked,
+                  minSize  = 15,
+                  maxSize  = 400)
+fgseaRes<-fgseaRes[fgseaRes$padj<0.15,] # significant pathways: 4
+fgseaRes <- fgseaRes[order(fgseaRes$NES, decreasing = T), ]
+
+print(fgseaRes$pathway)
+```
+
+```{r}
+saveRDS(fgseaRes,"~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/enrichedPathwaysGanitumab_traditionalApproach.rds")
+```
+
+### DGE-GSEA: Ganetespib
+
+```{r}
+# design matrix
+response <- factor(meta.gane$pCR, levels=c(0,1), labels=c("RD","pCR"))
+design <- model.matrix(~0 + response)
+rownames(design) <-rownames(meta.gane)
+contrast.matrix <- makeContrasts(responsepCR-responseRD, levels = design)
+
+# fit linear model
+fit <- lmFit(rna.expression.gane, design = design)
+fit <- contrasts.fit(fit, contrasts = contrast.matrix)
+efit <- eBayes(fit, trend = TRUE,robust = TRUE)
+degs_ebayes <- topTable(efit, adjust.method="BH", sort.by = "p", n=Inf, p.value = 1)
+
+# label significant genes
+treat_table <- degs_ebayes %>% 
+  mutate(expression = case_when(logFC >= 0 & adj.P.Val < 0.15 ~ "Up-regulated",
+                                logFC <= 0 & adj.P.Val < 0.15 ~ "Down-regulated",
+                                adj.P.Val>= 0.15 ~ "Not-DE"))
+
+print(degs_ebayes[1:10, ])
+print(treat_table[1:10, ]) # DE with updated threshold: 0
+```
+
+```{r}
+# rank all the genes by fold change
+treat_table <- treat_table[order(treat_table$logFC), ]
+treat.ranked <- treat_table$logFC
+names(treat.ranked) <- rownames(treat_table)
+```
+
+```{r}
+# perform enrichment analysis
+fgseaRes <- fgsea(pathways = reactome.pathways, 
+                  stats    = treat.ranked,
+                  minSize  = 15,
+                  maxSize  = 400)
+fgseaRes<-fgseaRes[fgseaRes$padj<0.15,] # significant pathways: 4
+fgseaRes <- fgseaRes[order(fgseaRes$NES, decreasing = T), ]
+
+print(fgseaRes$pathway)
+```
+
+```{r}
+saveRDS(fgseaRes,"~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/enrichedPathwaysGanetespib_traditionalApproach.rds")
+```
+
+### DGE-GSEA: Pembrolizumab
+
+```{r}
+# design matrix
+response <- factor(meta.pemb$pCR, levels=c(0,1), labels=c("RD","pCR"))
+design <- model.matrix(~0 + response)
+rownames(design) <-rownames(meta.pemb)
+contrast.matrix <- makeContrasts(responsepCR-responseRD, levels = design)
+
+# fit linear model
+fit <- lmFit(rna.expression.pemb, design = design)
+fit <- contrasts.fit(fit, contrasts = contrast.matrix)
+efit <- eBayes(fit, trend = TRUE,robust = TRUE)
+degs_ebayes <- topTable(efit, adjust.method="BH", sort.by = "p", n=Inf, p.value = 1)
+
+# label significant genes
+treat_table <- degs_ebayes %>% 
+  mutate(expression = case_when(logFC >= 0 & adj.P.Val < 0.15 ~ "Up-regulated",
+                                logFC <= 0 & adj.P.Val < 0.15 ~ "Down-regulated",
+                                adj.P.Val>= 0.15 ~ "Not-DE"))
+
+print(degs_ebayes[1:10, ])
+print(treat_table[1:10, ]) # DE with updated threshold: 0
+```
+
+```{r}
+# rank all the genes by fold change
+treat_table <- treat_table[order(treat_table$logFC), ]
+treat.ranked <- treat_table$logFC
+names(treat.ranked) <- rownames(treat_table)
+```
+
+```{r}
+# perform enrichment analysis
+fgseaRes <- fgsea(pathways = reactome.pathways, 
+                  stats    = treat.ranked,
+                  minSize  = 15,
+                  maxSize  = 400)
+fgseaRes<-fgseaRes[fgseaRes$padj<0.15,] # significant pathways: 4
+fgseaRes <- fgseaRes[order(fgseaRes$NES, decreasing = T), ]
+
+print(fgseaRes$pathway)
+```
+
+```{r}
+saveRDS(fgseaRes,"~/OneDrive - The Institute of Cancer Research/Jing_ClinicalTrialML_Data/output/data/Results_final/enrichedPathwaysPembrolizumab_traditionalApproach.rds")
+```
+
